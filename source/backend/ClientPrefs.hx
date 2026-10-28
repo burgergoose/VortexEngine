@@ -21,6 +21,8 @@ import states.TitleState;
 	public var lowQuality:Bool = false;
 	public var shaders:Bool = true;
 	public var cacheOnGPU:Bool = true; // GPU Caching made by Raltyro
+	public var vortexPixel:Bool = true;
+	public var streamAudio:Bool = true;
 	public var framerate:Int = 60;
 	public var camZooms:Bool = true;
 	public var hideHud:Bool = false;

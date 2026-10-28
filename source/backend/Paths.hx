@@ -266,14 +266,14 @@ class Paths
 		#end
 	}
 
-	inline static public function inst(song:String, ?modsAllowed:Bool = true):Sound
-		return returnSound('${formatToSongPath(song)}/Inst', 'songs', modsAllowed);
+	inline static public function inst(song:String, ?modsAllowed:Bool = true, ?stream:Bool = false):Sound
+		return returnSound('${formatToSongPath(song)}/Inst', 'songs', modsAllowed, true, stream);
 
-	inline static public function voices(song:String, postfix:String = null, ?modsAllowed:Bool = true):Sound
+	inline static public function voices(song:String, postfix:String = null, ?modsAllowed:Bool = true, ?stream:Bool = false):Sound
 	{
 		var songKey:String = '${formatToSongPath(song)}/Voices';
 		if(postfix != null) songKey += '-' + postfix;
-		return returnSound(songKey, 'songs', modsAllowed, false);
+		return returnSound(songKey, 'songs', modsAllowed, false, stream);
 	}
 
 	inline static public function soundRandom(key:String, min:Int, max:Int, ?modsAllowed:Bool = true)
@@ -297,16 +297,22 @@ class Paths
 		if (bitmap == null)
 		{
 			var file:String = getPath(key, IMAGE, parentFolder, true);
-			#if MODS_ALLOWED
-			if (FileSystem.exists(file))
-				bitmap = BitmapData.fromFile(file);
-			else #end if (OpenFlAssets.exists(file, IMAGE))
-				bitmap = OpenFlAssets.getBitmapData(file);
-
+			if (allowGPU && ClientPrefs.data.cacheOnGPU)
+				bitmap = backend.pixel.VortexPixel.upload(backend.pixel.VortexPixel.readCached(file, backend.AntiAliasing.mipmapsActive));
 			if (bitmap == null)
 			{
-				trace('Bitmap not found: $file | key: $key');
-				return null;
+				#if MODS_ALLOWED
+				if (FileSystem.exists(file))
+					bitmap = BitmapData.fromFile(file);
+				else #end if (OpenFlAssets.exists(file, IMAGE))
+					bitmap = OpenFlAssets.getBitmapData(file);
+
+				if (bitmap == null)
+				{
+					trace('Bitmap not found: $file | key: $key');
+					return null;
+				}
+				if (allowGPU && ClientPrefs.data.cacheOnGPU) backend.pixel.VortexPixel.request(file, bitmap.width, bitmap.height);
 			}
 		}
 
@@ -477,10 +483,41 @@ class Paths
 		return hideChars.replace(invalidChars.replace(path, '-'), '').trim().toLowerCase();
 	}
 
+	public static function streamable(key:String, ?path:String):Bool
+	{
+		if (!ClientPrefs.data.streamAudio) return false;
+		var file:String = getPath(Language.getFileTranslation(key) + '.$SOUND_EXT', SOUND, path, true);
+		return file.toLowerCase().endsWith('.ogg');
+	}
+
+	static function streamSound(file:String):Sound
+	{
+		#if (sys && lime_vorbis)
+		if (!ClientPrefs.data.streamAudio || !file.toLowerCase().endsWith('.ogg') || !FileSystem.exists(file)) return null;
+		try
+		{
+			var vorbis = lime.media.vorbis.VorbisFile.fromFile(file);
+			if (vorbis == null) return null;
+			var buffer = lime.media.AudioBuffer.fromVorbisFile(vorbis);
+			if (buffer == null) return null;
+			streamedSounds++;
+			return Sound.fromAudioBuffer(buffer);
+		}
+		catch (e:Dynamic) {}
+		#end
+		return null;
+	}
+
+	public static var streamedSounds:Int = 0;
 	public static var currentTrackedSounds:Map<String, Sound> = [];
-	public static function returnSound(key:String, ?path:String, ?modsAllowed:Bool = true, ?beepOnNull:Bool = true)
+	public static function returnSound(key:String, ?path:String, ?modsAllowed:Bool = true, ?beepOnNull:Bool = true, ?stream:Bool = false)
 	{
 		var file:String = getPath(Language.getFileTranslation(key) + '.$SOUND_EXT', SOUND, path, modsAllowed);
+		if (stream && !currentTrackedSounds.exists(file))
+		{
+			var streamed:Sound = streamSound(file);
+			if (streamed != null) return streamed;
+		}
 
 		if(!currentTrackedSounds.exists(file))
 		{

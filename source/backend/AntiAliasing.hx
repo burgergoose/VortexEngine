@@ -71,6 +71,7 @@ class AntiAliasing
 			trace('Anti-aliasing: could not read the GPU settings: $e');
 		}
 		FlxG.signals.postDraw.add(checkMipmaps);
+		FlxG.signals.postDraw.addOnce(backend.pixel.VortexPixel.init);
 		return true;
 	}
 
@@ -238,6 +239,15 @@ class AntiAliasing
 			var texture:TextureBase = bitmap.getTexture(context);
 			if (texture == null) return;
 			var gl = context.gl;
+			if (backend.pixel.VortexPixel.isCompressed(texture))
+			{
+				var ok = backend.pixel.VortexPixel.ensureMips(texture);
+				if (ok && desktopGL) applyBias(texture);
+				entry.texture = texture;
+				entry.version = bitmap.__textureVersion;
+				entry.ready = ok;
+				return;
+			}
 			var guard:Int = 0;
 			while (gl.getError() != gl.NO_ERROR && guard++ < 16) {}
 			context.__bindGLTexture2D(texture.__textureID);

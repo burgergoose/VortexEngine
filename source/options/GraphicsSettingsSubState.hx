@@ -52,6 +52,18 @@ class GraphicsSettingsSubState extends BaseOptionsMenu
 			BOOL);
 		addOption(option);
 
+		var option:Option = new Option('VortexPixel',
+			"If checked, big pictures are compressed on the GPU (BC7). They use about 4x less memory\nand load faster after the first time. Needs GPU Caching.",
+			'vortexPixel',
+			BOOL);
+		addOption(option);
+
+		var option:Option = new Option('Stream Song Audio',
+			"If checked, songs play straight from the .ogg file instead of being decoded into RAM first.\nLoads faster and uses a lot less RAM. Turn it off if a mod needs the raw audio.",
+			'streamAudio',
+			BOOL);
+		addOption(option);
+
 		#if !html5
 		var option:Option = new Option('Framerate',
 			"Pretty self explanatory, isn't it?",

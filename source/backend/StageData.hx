@@ -122,6 +122,9 @@ class StageData {
 	public static function isBuiltIn(name:String):Bool
 		return ['stage', 'spooky', 'philly', 'limo', 'mall', 'mallEvil', 'school', 'schoolEvil', 'tank', 'phillyStreets', 'phillyBlazin'].contains(name);
 
+	public static function needsRawAudio(stage:String):Bool
+		return stage != null && ['phillystreets', 'phillyblazin'].contains(stage.toLowerCase());
+
 	public static function vanillaSongStage(songName):String
 	{
 		switch (songName)

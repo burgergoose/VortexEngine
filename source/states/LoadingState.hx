@@ -43,6 +43,7 @@ class LoadingState extends MusicBeatState
 
 	static var originalBitmapKeys:Map<String, String> = [];
 	static var requestedBitmaps:Map<String, BitmapData> = [];
+	static var requestedPayloads:Map<String, backend.pixel.VortexPixel.Payload> = [];
 	static var mutex:Mutex = new Mutex();
 	static var threadPool:FixedThreadPool = null;
 
@@ -356,20 +357,36 @@ class LoadingState extends MusicBeatState
 		var keys:Array<String> = [];
 		var bitmaps:Array<BitmapData> = [];
 		var originals:Array<String> = [];
+		var payloads:Array<backend.pixel.VortexPixel.Payload> = [];
 		mutex.acquire();
 		for (key => bitmap in requestedBitmaps)
 		{
 			keys.push(key);
 			bitmaps.push(bitmap);
 			originals.push(originalBitmapKeys.get(key));
+			payloads.push(null);
+		}
+		for (key => payload in requestedPayloads)
+		{
+			keys.push(key);
+			bitmaps.push(null);
+			originals.push(originalBitmapKeys.get(key));
+			payloads.push(payload);
 		}
 		requestedBitmaps.clear();
+		requestedPayloads.clear();
 		originalBitmapKeys.clear();
 		var done:Bool = (loaded >= loadMax && initialThreadCompleted);
 		mutex.release();
 
 		for (i in 0...keys.length)
 		{
+			if (payloads[i] != null)
+			{
+				bitmaps[i] = backend.pixel.VortexPixel.upload(payloads[i]);
+				if (bitmaps[i] == null) bitmaps[i] = BitmapData.fromFile(keys[i]);
+			}
+			else if (bitmaps[i] != null) backend.pixel.VortexPixel.request(keys[i], bitmaps[i].width, bitmaps[i].height);
 			if (bitmaps[i] != null && Paths.cacheBitmap(originals[i], bitmaps[i]) != null) {}
 			else trace('failed to cache image ${keys[i]}');
 		}
@@ -582,7 +599,7 @@ class LoadingState extends MusicBeatState
 				prepare(imgs, snds, mscs);
 			}
 
-			songsToPrepare.push('$folder/Inst');
+			if (!Paths.streamable('$folder/Inst', 'songs') || StageData.needsRawAudio(song.stage)) songsToPrepare.push('$folder/Inst');
 
 			var player1:String = song.player1;
 			var player2:String = song.player2;
@@ -596,11 +613,11 @@ class LoadingState extends MusicBeatState
 			{
 				if(Paths.fileExists('$prefixVocals-Player.${Paths.SOUND_EXT}', SOUND, false, 'songs') && Paths.fileExists('$prefixVocals-Opponent.${Paths.SOUND_EXT}', SOUND, false, 'songs'))
 				{
-					songsToPrepare.push('$prefixVocals-Player');
-					songsToPrepare.push('$prefixVocals-Opponent');
+					prepareSong('$prefixVocals-Player');
+					prepareSong('$prefixVocals-Opponent');
 				}
 				else if(Paths.fileExists('$prefixVocals.${Paths.SOUND_EXT}', SOUND, false, 'songs'))
-					songsToPrepare.push(prefixVocals);
+					prepareSong(prefixVocals);
 			}
 
 			if (player2 != player1)
@@ -632,6 +649,11 @@ class LoadingState extends MusicBeatState
 			catch(e:Dynamic) { loadMax = 0; loaded = 0; }
 			initialThreadCompleted = true;
 		});
+	}
+
+	static function prepareSong(key:String):Void
+	{
+		if (!Paths.streamable(key, 'songs')) songsToPrepare.push(key);
 	}
 
 	public static function clearInvalids()
@@ -785,7 +807,7 @@ class LoadingState extends MusicBeatState
 			if (prefixVocals != null && character.vocals_file != null && character.vocals_file.length > 0)
 			{
 				mutex.acquire();
-				songsToPrepare.push(prefixVocals + "-" + character.vocals_file);
+				prepareSong(prefixVocals + "-" + character.vocals_file);
 				mutex.release();
 				if(char == PlayState.SONG.player1) dontPreloadDefaultVoices = true;
 			}
@@ -823,7 +845,7 @@ class LoadingState extends MusicBeatState
 		return Paths.currentTrackedSounds.get(file);
 	}
 
-	static function preloadGraphic(key:String):Null<BitmapData>
+	static function preloadGraphic(key:String):Dynamic
 	{
 		try {
 			var requestKey:String = 'images/$key';
@@ -835,6 +857,15 @@ class LoadingState extends MusicBeatState
 				var file:String = Paths.getPath(requestKey, IMAGE);
 				if (#if sys FileSystem.exists(file) || #end OpenFlAssets.exists(file, IMAGE))
 				{
+					var payload = ClientPrefs.data.cacheOnGPU ? backend.pixel.VortexPixel.readCached(file, backend.AntiAliasing.mipmapsActive) : null;
+					if (payload != null)
+					{
+						mutex.acquire();
+						requestedPayloads.set(file, payload);
+						originalBitmapKeys.set(file, requestKey);
+						mutex.release();
+						return payload;
+					}
 					#if sys
 					var bitmap:BitmapData = BitmapData.fromFile(file);
 					#else

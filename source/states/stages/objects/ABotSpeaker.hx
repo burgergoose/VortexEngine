@@ -120,6 +120,8 @@ class ABotSpeaker extends FlxSpriteGroup
 	public function initAnalyzer()
 	{
 		@:privateAccess
+		if (snd == null || snd._channel == null || snd._channel.__audioSource == null || snd._channel.__audioSource.buffer.data == null) return;
+		@:privateAccess
 		analyzer = new SpectralAnalyzer(snd._channel.__audioSource, 7, 0.1, 40);
 	
 		#if desktop

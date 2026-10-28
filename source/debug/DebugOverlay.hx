@@ -95,6 +95,7 @@ class DebugOverlay extends TextField
 			lines.push('Script errors: ${psychlua.ScriptLog.errorCount} (details in ${psychlua.ScriptLog.FILE})');
 			lines.push('Build: ' + backend.BuildVerifier.describe());
 		lines.push(backend.AntiAliasing.describe());
+		lines.push(backend.pixel.VortexPixel.describe());
 
 		text = lines.join('\n');
 		textColor = 0xFFB8FFEA;

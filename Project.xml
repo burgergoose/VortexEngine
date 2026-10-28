@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <project>
 
-	<app title="Friday Night Funkin': Vortex Engine" file="VortexEngine" packageName="com.vortexengine.game" package="com.vortexengine.game" main="Main" version="1.0.1" company="Vortex Engine" />
+	<app title="Friday Night Funkin': Vortex Engine" file="VortexEngine" packageName="com.vortexengine.game" package="com.vortexengine.game" main="Main" version="1.1.0" company="Vortex Engine" />
 
 	<set name="APP_ID" value="0x0100f6c013bbc000" />
 
@@ -116,6 +116,7 @@
 	<define name="x86_BUILD" if="32bits" />
 	
 	<haxedef name="FLX_NO_FOCUS_LOST_SCREEN" />
+	<haxedef name="native_audio_buffers" value="6" />
 	
 	<haxedef name="HXC_DEBUG_TRACE" if="debug" />
 	

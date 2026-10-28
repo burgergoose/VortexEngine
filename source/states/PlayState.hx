@@ -1279,16 +1279,16 @@ class PlayState extends MusicBeatState
 			{
 				var playerVocals = null;
 				var vsPlayer:Dynamic = Reflect.field(songData, 'vortexPlayerVocals');
-				if(vsPlayer != null) playerVocals = Paths.voices(songData.song, Std.string(vsPlayer));
-				if(playerVocals == null) playerVocals = Paths.voices(songData.song, (boyfriend.vocalsFile == null || boyfriend.vocalsFile.length < 1) ? 'Player' : boyfriend.vocalsFile);
-				if(playerVocals == null && songData.player1 != null) playerVocals = Paths.voices(songData.song, songData.player1);
-				vocals.loadEmbedded(playerVocals != null ? playerVocals : Paths.voices(songData.song));
+				if(vsPlayer != null) playerVocals = Paths.voices(songData.song, Std.string(vsPlayer), true, true);
+				if(playerVocals == null) playerVocals = Paths.voices(songData.song, (boyfriend.vocalsFile == null || boyfriend.vocalsFile.length < 1) ? 'Player' : boyfriend.vocalsFile, true, true);
+				if(playerVocals == null && songData.player1 != null) playerVocals = Paths.voices(songData.song, songData.player1, true, true);
+				vocals.loadEmbedded(playerVocals != null ? playerVocals : Paths.voices(songData.song, null, true, true));
 				
 				var oppVocals = null;
 				var vsOpponent:Dynamic = Reflect.field(songData, 'vortexOpponentVocals');
-				if(vsOpponent != null) oppVocals = Paths.voices(songData.song, Std.string(vsOpponent));
-				if(oppVocals == null) oppVocals = Paths.voices(songData.song, (dad.vocalsFile == null || dad.vocalsFile.length < 1) ? 'Opponent' : dad.vocalsFile);
-				if(oppVocals == null && songData.player2 != null) oppVocals = Paths.voices(songData.song, songData.player2);
+				if(vsOpponent != null) oppVocals = Paths.voices(songData.song, Std.string(vsOpponent), true, true);
+				if(oppVocals == null) oppVocals = Paths.voices(songData.song, (dad.vocalsFile == null || dad.vocalsFile.length < 1) ? 'Opponent' : dad.vocalsFile, true, true);
+				if(oppVocals == null && songData.player2 != null) oppVocals = Paths.voices(songData.song, songData.player2, true, true);
 				if(oppVocals != null && oppVocals.length > 0) opponentVocals.loadEmbedded(oppVocals);
 			}
 		}
@@ -1306,7 +1306,7 @@ class PlayState extends MusicBeatState
 		inst = new FlxSound();
 		try
 		{
-			inst.loadEmbedded(Paths.inst(songData.song));
+			inst.loadEmbedded(Paths.inst(songData.song, true, !StageData.needsRawAudio(curStage)));
 		}
 		catch (e:Dynamic) {}
 		FlxG.sound.list.add(inst);
