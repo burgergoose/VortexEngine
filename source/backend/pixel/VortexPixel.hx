@@ -10,6 +10,7 @@ import openfl.display.BitmapData;
 import openfl.display3D.textures.TextureBase;
 import sys.FileSystem;
 import sys.io.File;
+import sys.io.FileSeek;
 import sys.thread.Deque;
 import sys.thread.Lock;
 import sys.thread.Mutex;
@@ -17,15 +18,19 @@ import sys.thread.Thread;
 
 class VortexPixel
 {
-	public static inline var VERSION:Int = 2;
+	public static inline var VERSION:Int = 3;
 	public static inline var MIN_PIXELS:Int = 256 * 256;
 	public static inline var MIN_PSNR:Float = 44;
 	public static inline var MAX_BAD:Float = 0.005;
 	public static inline var MAX_BAD_PIXEL_ART:Float = 0.0002;
 	public static inline var PIXEL_ART_EDGES:Float = 0.002;
+	public static inline var MIN_BACK_PSNR:Float = 50;
+	static inline var BAND_BLOCKS:Int = 16;
+	static inline var BAND_ROWS:Int = 32;
 
 	static inline var BPTC:Int = 0x8E8C;
 	static inline var TEXTURE_MAX_LEVEL:Int = 0x813D;
+	static inline var TEXTURE_LOD_BIAS:Int = 0x8501;
 	static inline var MAGIC:Int = 0x31505856;
 
 	public static var supported(default, null):Bool = false;
@@ -33,6 +38,9 @@ class VortexPixel
 	public static var fromCache(default, null):Int = 0;
 	public static var encoded(default, null):Int = 0;
 	public static var kept(default, null):Int = 0;
+	public static var enhancedCount(default, null):Int = 0;
+	public static var resumedUnits(default, null):Int = 0;
+	public static var maxTexture(default, null):Int = 4096;
 	public static var encodeSeconds(default, null):Float = 0;
 	public static var loadSeconds(default, null):Float = 0;
 	public static var lastResult(default, null):String = '';
@@ -50,6 +58,9 @@ class VortexPixel
 	static var helpers:Int = 0;
 	static var hold:Bool = false;
 	static var owned:Map<TextureBase, Owned> = new Map();
+	static var budgetMutex:Mutex = new Mutex();
+	static var inFlight:Float = 0;
+	static inline var BUDGET:Float = 256 * 1048576;
 
 	static function get_active():Bool
 		return supported && ClientPrefs.data.vortexPixel && ClientPrefs.data.cacheOnGPU;
@@ -81,6 +92,8 @@ class VortexPixel
 				status = 'off (this GPU has no BC7)';
 				return;
 			}
+			var max:Dynamic = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+			if (max != null && Std.int(max) > 0) maxTexture = Std.int(max);
 			if (!pickFolder())
 			{
 				status = 'off (no folder to save the cache in)';
@@ -132,7 +145,7 @@ class VortexPixel
 	static function updateHold():Void
 	{
 		var state = FlxG.state;
-		hold = (Std.isOfType(state, states.PlayState) && state.subState == null) || Std.isOfType(state, states.LoadingState)
+		hold = Std.isOfType(state, states.PlayState) || Std.isOfType(state, states.LoadingState)
 			|| states.LoadingState.loadMax > 0;
 	}
 
@@ -180,7 +193,7 @@ class VortexPixel
 		return b;
 	}
 
-	public static function readCached(file:String, mips:Bool):Payload
+	public static function readCached(file:String, mips:Bool, ?budget:Bool = false):Payload
 	{
 		if (!active || file == null) return null;
 		mutex.acquire();
@@ -200,6 +213,7 @@ class VortexPixel
 			if (info == null) return null;
 			var input = File.read(path, true);
 			var p:Payload = null;
+			var upgrade = false;
 			try
 			{
 				if (input.readInt32() != MAGIC || input.readByte() != VERSION) throw 'old';
@@ -219,26 +233,46 @@ class VortexPixel
 					input.close();
 					return null;
 				}
-				p = new Payload(file, w, h, levels);
-				var count = mips ? levels : 1;
-				for (i in 0...count)
+				var wantEnhance = ClientPrefs.data.vortexEnhance;
+				if (flags & 4 == 4 && wantEnhance) throw 'redo';
+				var enhanced = flags & 2 == 2;
+				var skip = enhanced && !wantEnhance ? 1 : 0;
+				upgrade = flags & 8 == 8 && wantEnhance;
+				var scale = enhanced && wantEnhance ? 2 : 1;
+				p = new Payload(file, w, h, levels - skip, scale);
+				var count = (scale > 1 || mips) ? p.total : 1;
+				if (budget)
 				{
-					var raw = input.readInt32();
-					var z = input.read(input.readInt32());
-					p.levels.push(haxe.zip.Uncompress.run(z, raw));
+					var bytes = 0.0;
+					for (i in 0...count)
+					{
+						var lw = (w * scale) >> i;
+						var lh = (h * scale) >> i;
+						bytes += BC7.blocksSize(lw < 1 ? 1 : lw, lh < 1 ? 1 : lh);
+					}
+					reserve(bytes);
+					p.reserved = bytes;
+				}
+				for (i in 0...skip + count)
+				{
+					var level = readLevel(input, i < skip);
+					if (i >= skip) p.levels.push(level);
 				}
 				input.close();
 			}
 			catch (e:Dynamic)
 			{
 				input.close();
+				if (p != null) unreserve(p);
 				forget(file);
 				return null;
 			}
 			mutex.acquire();
-			known.set(file, 1);
+			var queued = known.get(file) == 4;
+			if (!queued) known.set(file, 1);
 			loadSeconds += Sys.time() - start;
 			mutex.release();
+			if (upgrade && !queued) queue(file, 4);
 			return p;
 		}
 		catch (e:Dynamic)
@@ -247,12 +281,76 @@ class VortexPixel
 		}
 	}
 
+	static function reserve(bytes:Float):Void
+	{
+		var start = Sys.time();
+		while (true)
+		{
+			budgetMutex.acquire();
+			if (inFlight <= 0 || inFlight + bytes <= BUDGET || Sys.time() - start > 3)
+			{
+				inFlight += bytes;
+				budgetMutex.release();
+				return;
+			}
+			budgetMutex.release();
+			Sys.sleep(0.005);
+		}
+	}
+
+	public static function unreserve(p:Payload):Void
+	{
+		if (p == null || p.reserved <= 0) return;
+		budgetMutex.acquire();
+		inFlight -= p.reserved;
+		if (inFlight < 0) inFlight = 0;
+		budgetMutex.release();
+		p.reserved = 0;
+	}
+
+	static function readLevel(input:sys.io.FileInput, discard:Bool):Bytes
+	{
+		var total = input.readInt32();
+		var chunks = input.readInt32();
+		var data = discard ? null : Bytes.alloc(total);
+		var pos = 0;
+		for (i in 0...chunks)
+		{
+			var raw = input.readInt32();
+			var zlen = input.readInt32();
+			if (discard)
+			{
+				input.seek(zlen, SeekCur);
+				continue;
+			}
+			var piece = haxe.zip.Uncompress.run(input.read(zlen), raw);
+			data.blit(pos, piece, 0, piece.length);
+			pos += piece.length;
+		}
+		if (!discard && pos != total) throw 'short level';
+		return data;
+	}
+
 	@:access(openfl.display.BitmapData)
 	@:access(openfl.display3D.Context3D)
 	@:access(openfl.display3D.textures.TextureBase)
 	public static function upload(p:Payload):BitmapData
 	{
-		if (p == null || p.levels.length == 0) return null;
+		var bitmap = uploadLevels(p);
+		if (p != null)
+		{
+			unreserve(p);
+			p.levels = null;
+		}
+		return bitmap;
+	}
+
+	@:access(openfl.display.BitmapData)
+	@:access(openfl.display3D.Context3D)
+	@:access(openfl.display3D.textures.TextureBase)
+	static function uploadLevels(p:Payload):BitmapData
+	{
+		if (p == null || p.levels == null || p.levels.length == 0) return null;
 		prune();
 		var context = Lib.current.stage.context3D;
 		var gl = context.gl;
@@ -264,7 +362,8 @@ class VortexPixel
 		context.__bindGLTexture2D(texture.__textureID);
 		var ok = sendLevels(gl, p, 0);
 		gl.texParameteri(gl.TEXTURE_2D, TEXTURE_MAX_LEVEL, p.levels.length - 1);
-		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, p.scale > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+		if (p.scale > 1) gl.texParameterf(gl.TEXTURE_2D, TEXTURE_LOD_BIAS, backend.AntiAliasing.mipmapBias);
 		ok = ok && gl.getError() == gl.NO_ERROR;
 		context.__bindGLTexture2D(null);
 		if (!ok)
@@ -279,7 +378,7 @@ class VortexPixel
 		bitmap.__textureWidth = p.width;
 		bitmap.__textureHeight = p.height;
 		bitmap.readable = true;
-		var entry = new Owned(p.file, p.width, p.height, p.total, p.levels.length);
+		var entry = new Owned(p.file, p.width, p.height, p.total, p.levels.length, p.scale);
 		owned.set(texture, entry);
 		p.levels = null;
 		fromCache++;
@@ -290,8 +389,8 @@ class VortexPixel
 	{
 		for (i in first...first + p.levels.length)
 		{
-			var w = p.width >> i;
-			var h = p.height >> i;
+			var w = (p.width * p.scale) >> i;
+			var h = (p.height * p.scale) >> i;
 			if (w < 1) w = 1;
 			if (h < 1) h = 1;
 			var data = p.levels[i - first];
@@ -310,6 +409,13 @@ class VortexPixel
 	public static function isCompressed(texture:TextureBase):Bool
 		return texture != null && owned.exists(texture);
 
+	public static function isEnhanced(texture:TextureBase):Bool
+	{
+		if (texture == null) return false;
+		var entry = owned.get(texture);
+		return entry != null && entry.scale > 1;
+	}
+
 	@:access(openfl.display3D.Context3D)
 	@:access(openfl.display3D.textures.TextureBase)
 	public static function ensureMips(texture:TextureBase):Bool
@@ -318,7 +424,7 @@ class VortexPixel
 		if (entry == null) return false;
 		if (entry.loaded >= entry.total) return true;
 		var p = readCached(entry.file, true);
-		if (p == null || p.levels.length != entry.total) return false;
+		if (p == null || p.levels.length != entry.total || p.scale != entry.scale) return false;
 		p.levels.splice(0, entry.loaded);
 		var context = Lib.current.stage.context3D;
 		var gl = context.gl;
@@ -336,13 +442,19 @@ class VortexPixel
 	public static function request(file:String, width:Int, height:Int):Void
 	{
 		if (!active || file == null || width * height < MIN_PIXELS) return;
+		queue(file, 3);
+	}
+
+	static function queue(file:String, state:Int):Void
+	{
 		mutex.acquire();
-		if (known.exists(file))
+		var now = known.get(file);
+		if (now == 3 || now == 4 || (state == 3 && known.exists(file)))
 		{
 			mutex.release();
 			return;
 		}
-		known.set(file, 3);
+		known.set(file, state);
 		jobs.push(file);
 		var start = !workerRunning;
 		workerRunning = true;
@@ -355,6 +467,7 @@ class VortexPixel
 	{
 		if (!supported) return 'VortexPixel: $status';
 		var count = 0;
+		var sharp = 0;
 		var bc7 = 0.0;
 		var rgba = 0.0;
 		var gone = [];
@@ -366,15 +479,17 @@ class VortexPixel
 				continue;
 			}
 			count++;
+			if (entry.scale > 1) sharp++;
 			var mipScale = entry.loaded > 1 ? 4 / 3 : 1;
-			bc7 += entry.width * entry.height * mipScale;
-			rgba += entry.width * entry.height * 4 * mipScale;
+			bc7 += entry.width * entry.height * entry.scale * entry.scale * mipScale;
+			rgba += entry.width * entry.height * 4 * (backend.AntiAliasing.mipmapsActive ? 4 / 3 : 1);
 		}
 		for (texture in gone) owned.remove(texture);
 		mutex.acquire();
 		var waiting = jobs.length;
 		mutex.release();
-		return 'VortexPixel: ${active ? 'on' : 'off in options'}, $count BC7 textures (${Math.round(bc7 / 1048576)} MB instead of ${Math.round(rgba / 1048576)} MB)'
+		return 'VortexPixel: ${active ? 'on' : 'off in options'}${ClientPrefs.data.vortexEnhance ? '' : ' (enhance off)'}, $count cached textures, $sharp enhanced 2x'
+			+ ' (${Math.round(bc7 / 1048576)} MB, plain PNGs would be ${Math.round(rgba / 1048576)} MB)'
 			+ ', $fromCache loaded from cache, $encoded made${waiting > 0 ? ', $waiting waiting' + (hold ? ' (paused)' : '') : ''}, $kept kept as PNG'
 			+ (lastResult.length > 0 ? '\n  last: $lastResult' : '');
 	}
@@ -386,12 +501,14 @@ class VortexPixel
 			tasks = new Deque<Task>();
 			for (i in 0...helpers)
 				Thread.create(function() {
+					var encoder = new BC7Encoder();
+					var enhancer = new Enhance();
 					while (true)
 					{
 						var t = tasks.pop(true);
 						try
 						{
-							t.encoder.encodeRows(t.rgba, t.width, t.height, t.out, 0, t.from, t.to, pausePoint);
+							runTask(t, encoder, enhancer);
 						}
 						catch (e:Dynamic)
 						{
@@ -401,7 +518,6 @@ class VortexPixel
 					}
 				});
 		}
-		var encoders = [for (i in 0...helpers) new BC7Encoder()];
 		while (true)
 		{
 			while (hold) Sys.sleep(0.25);
@@ -409,14 +525,21 @@ class VortexPixel
 			var file = jobs.shift();
 			if (file == null) workerRunning = false;
 			mutex.release();
-			if (file == null) return;
+			if (file == null)
+			{
+				#if cpp
+				cpp.vm.Gc.run(true);
+				#end
+				return;
+			}
 			var result = 0;
 			try
 			{
-				result = encodeFile(file, encoders);
+				result = encodeFile(file);
 			}
 			catch (e:Dynamic)
 			{
+				trace('VortexPixel: $file failed: $e');
 				result = -1;
 			}
 			mutex.acquire();
@@ -430,12 +553,42 @@ class VortexPixel
 		}
 	}
 
+	static function runTask(t:Task, encoder:BC7Encoder, enhancer:Enhance):Void
+	{
+		encoder.sse = 0;
+		encoder.counted = 0;
+		encoder.badPixels = 0;
+		encoder.maxErr = 0;
+		encoder.checkDecode = t.check;
+		if (t.enhance)
+		{
+			enhancer.sse = 0;
+			enhancer.counted = 0;
+			var band = enhancer.band(t.rgba, t.width, t.height, t.from, t.to);
+			var bh = (t.to - t.from) * 2;
+			var blocks = (bh + 3) >> 2;
+			t.out = Bytes.alloc(BC7.blocksSize(t.width * 2, bh));
+			encoder.encodeRows(band, t.width * 2, bh, t.out, 0, 0, blocks, pausePoint);
+			t.bpSse = enhancer.sse;
+			t.bpCounted = enhancer.counted;
+		}
+		else
+		{
+			var bw = (t.width + 3) >> 2;
+			t.out = Bytes.alloc((t.to - t.from) * bw * 16);
+			encoder.encodeRows(t.rgba, t.width, t.height, t.out, -t.from * bw * 16, t.from, t.to, pausePoint);
+		}
+		t.sse = encoder.sse;
+		t.counted = encoder.counted;
+		t.bad = encoder.badPixels;
+	}
+
 	static function pausePoint():Void
 	{
 		if (hold) throw new Paused();
 	}
 
-	static function encodeFile(file:String, encoders:Array<BC7Encoder>):Int
+	static function encodeFile(file:String):Int
 	{
 		var info = sourceInfo(file);
 		if (info == null) return 2;
@@ -449,105 +602,188 @@ class VortexPixel
 		if (image.buffer.premultiplied) image.buffer.premultiplied = false;
 		var pixelArt = BC7.premultiply(rgba) < PIXEL_ART_EDGES;
 		image = null;
+		var wantEnhance = ClientPrefs.data.vortexEnhance;
+		var enh = wantEnhance && !pixelArt && w * 2 <= maxTexture && h * 2 <= maxTexture;
 
-		var levels:Array<Bytes> = [];
-		var raws:Array<Int> = [];
-		var lw = w;
-		var lh = h;
-		var psnr = 0.0;
-		var bad = 0.0;
-		var level = 0;
+		var part = new Partial(cacheFile(file) + '.part', info, w, h, enh);
+		var mipSizes = [];
+		var mw = w;
+		var mh = h;
 		while (true)
 		{
-			var out = Bytes.alloc(BC7.blocksSize(lw, lh));
-			var bh = (lh + 3) >> 2;
-			var parts = Std.int(Math.min(encoders.length, bh));
-			var done = new Lock();
-			var list:Array<Task> = [];
-			for (i in 0...parts)
-			{
-				var e = encoders[i];
-				e.sse = 0;
-				e.counted = 0;
-				e.badPixels = 0;
-				e.maxErr = 0;
-				e.checkDecode = level == 0;
-				var t = new Task(e, rgba, lw, lh, out, Std.int(bh * i / parts), Std.int(bh * (i + 1) / parts), done);
-				list.push(t);
-				tasks.add(t);
-			}
-			for (i in 0...parts) done.wait();
-			for (t in list) if (t.failed) return 0;
-			if (level == 0)
-			{
-				var sse = 0.0, counted = 0.0, badPx = 0.0;
-				for (i in 0...parts)
-				{
-					sse += encoders[i].sse;
-					counted += encoders[i].counted;
-					badPx += encoders[i].badPixels;
-				}
-				psnr = counted > 0 && sse > 0 ? 10 * Math.log(65025 / (sse / (counted * 4))) / Math.log(10) : 99;
-				bad = counted > 0 ? badPx / counted : 0;
-				if (psnr < MIN_PSNR || bad > (pixelArt ? MAX_BAD_PIXEL_ART : MAX_BAD))
-				{
-					writeEntry(file, info, w, h, 1, [], []);
-					finish(file, start, psnr, bad, false, pixelArt);
-					return 2;
-				}
-			}
-			raws.push(out.length);
-			levels.push(haxe.zip.Compress.run(out, 3));
-			if (lw == 1 && lh == 1) break;
-			if (hold) return 0;
-			rgba = BC7.halve(rgba, lw, lh);
-			lw = lw > 1 ? lw >> 1 : 1;
-			lh = lh > 1 ? lh >> 1 : 1;
-			level++;
+			mipSizes.push([mw, mh]);
+			if (mw == 1 && mh == 1) break;
+			mw = mw > 1 ? mw >> 1 : 1;
+			mh = mh > 1 ? mh >> 1 : 1;
 		}
-		writeEntry(file, info, w, h, 0, levels, raws);
-		finish(file, start, psnr, bad, true, pixelArt);
+		var images:Array<Bytes> = [rgba];
+
+		function plain(level:Int):Bool
+		{
+			while (images.length <= level)
+			{
+				var prev = mipSizes[images.length - 1];
+				images.push(BC7.halve(images[images.length - 1], prev[0], prev[1]));
+			}
+			var size = mipSizes[level];
+			var bh = (size[1] + 3) >> 2;
+			var units = [];
+			var b = 0;
+			while (b < bh)
+			{
+				var e = b + BAND_BLOCKS > bh ? bh : b + BAND_BLOCKS;
+				units.push([b, e]);
+				b = e;
+			}
+			return runUnits(part, kindOf(level), units, images[level], size[0], size[1], level == 0, false);
+		}
+
+		if (!plain(0)) return pause(part);
+		var main = part.stats(0);
+		var psnr = main[0];
+		var bad = main[1];
+		if (psnr < MIN_PSNR || bad > (pixelArt ? MAX_BAD_PIXEL_ART : MAX_BAD))
+		{
+			writeEntry(file, info, w, h, 1, [], part);
+			part.remove();
+			finish(file, start, psnr, bad, false, pixelArt, false, 0);
+			return 2;
+		}
+		for (level in 1...mipSizes.length) if (!plain(level)) return pause(part);
+		var oneX = [for (level in 0...mipSizes.length) kindOf(level)];
+		if (!enh)
+		{
+			writeEntry(file, info, w, h, wantEnhance ? 0 : 4, oneX, part);
+			part.remove();
+			finish(file, start, psnr, bad, true, pixelArt, false, 0);
+			return 1;
+		}
+		if (part.count(1) == 0) writeEntry(file, info, w, h, 8, oneX, part);
+		var units = [];
+		var y = 0;
+		while (y < h)
+		{
+			var e = y + BAND_ROWS > h ? h : y + BAND_ROWS;
+			units.push([y, e]);
+			y = e;
+		}
+		if (!runUnits(part, 1, units, rgba, w, h, true, true)) return pause(part);
+		var up = part.stats(1);
+		var upOk = up[0] >= MIN_PSNR && up[1] <= MAX_BAD && up[2] >= MIN_BACK_PSNR;
+		writeEntry(file, info, w, h, upOk ? 2 : 0, upOk ? [1].concat(oneX) : oneX, part);
+		part.remove();
+		finish(file, start, psnr, bad, true, pixelArt, upOk, up[2]);
 		return 1;
 	}
 
-	static function finish(file:String, start:Float, psnr:Float, bad:Float, ok:Bool, pixelArt:Bool):Void
+	static inline function kindOf(level:Int):Int
+		return level == 0 ? 0 : level + 1;
+
+	static function pause(part:Partial):Int
+	{
+		part.close();
+		return 0;
+	}
+
+	static function runUnits(part:Partial, kind:Int, units:Array<Array<Int>>, rgba:Bytes, w:Int, h:Int, check:Bool, enhance:Bool):Bool
+	{
+		var todo = [for (i in 0...units.length) if (!part.has(kind, i)) i];
+		resumedUnits += units.length - todo.length;
+		var batch = helpers * 2;
+		var i = 0;
+		while (i < todo.length)
+		{
+			if (hold) return false;
+			var done = new Lock();
+			var list:Array<Task> = [];
+			var n = Std.int(Math.min(batch, todo.length - i));
+			for (j in 0...n)
+			{
+				var u = units[todo[i + j]];
+				var t = new Task(rgba, w, h, u[0], u[1], done, check, enhance);
+				t.index = todo[i + j];
+				list.push(t);
+				tasks.add(t);
+			}
+			for (j in 0...n) done.wait();
+			var failed = false;
+			for (t in list)
+			{
+				if (t.failed)
+				{
+					failed = true;
+					continue;
+				}
+				part.add(kind, t.index, t.out, t.sse, t.counted, t.bad, t.bpSse, t.bpCounted);
+				t.out = null;
+			}
+			if (failed) return false;
+			i += n;
+		}
+		return part.count(kind) >= units.length;
+	}
+
+	static function finish(file:String, start:Float, psnr:Float, bad:Float, ok:Bool, pixelArt:Bool, enhanced:Bool, back:Float):Void
 	{
 		mutex.acquire();
 		encodeSeconds += Sys.time() - start;
 		if (ok) encoded++;
 		else kept++;
-		lastResult = haxe.io.Path.withoutDirectory(file) + ' ' + (ok ? 'BC7' : 'kept as PNG') + (pixelArt ? ' (pixel art)' : '') + ', ${Math.round(psnr * 10) / 10} dB, '
-			+ '${Math.round(bad * 100000) / 1000}% pixels off by >8, ${Math.round((Sys.time() - start) * 10) / 10} s';
+		if (enhanced) enhancedCount++;
+		lastResult = haxe.io.Path.withoutDirectory(file) + ' ' + (ok ? (enhanced ? 'enhanced 2x + BC7' : 'BC7') : 'kept as PNG') + (pixelArt ? ' (pixel art)' : '')
+			+ ', ${Math.round(psnr * 10) / 10} dB, ${Math.round(bad * 100000) / 1000}% pixels off by >8'
+			+ (enhanced ? ', shrinks back at ${Math.round(back * 10) / 10} dB' : '') + ', ${Math.round((Sys.time() - start) * 10) / 10} s';
 		mutex.release();
 		trace('VortexPixel: $lastResult');
 	}
 
-	static function writeEntry(file:String, info:Array<Float>, w:Int, h:Int, flags:Int, levels:Array<Bytes>, raws:Array<Int>):Void
+	static function writeEntry(file:String, info:Array<Float>, w:Int, h:Int, flags:Int, kinds:Array<Int>, part:Partial):Void
 	{
 		var path = cacheFile(file);
 		var tmp = path + '.tmp';
 		var out = File.write(tmp, true);
-		out.writeInt32(MAGIC);
-		out.writeByte(VERSION);
-		out.writeByte(flags);
-		out.writeDouble(info[0]);
-		out.writeDouble(info[1]);
-		out.writeInt32(w);
-		out.writeInt32(h);
-		out.writeByte(levels.length);
-		var src = haxe.io.Path.normalize(FileSystem.absolutePath(file));
-		var srcBytes = Bytes.ofString(src);
-		out.writeUInt16(srcBytes.length);
-		out.write(srcBytes);
-		for (i in 0...levels.length)
+		try
 		{
-			out.writeInt32(raws[i]);
-			out.writeInt32(levels[i].length);
-			out.write(levels[i]);
+			out.writeInt32(MAGIC);
+			out.writeByte(VERSION);
+			out.writeByte(flags);
+			out.writeDouble(info[0]);
+			out.writeDouble(info[1]);
+			out.writeInt32(w);
+			out.writeInt32(h);
+			out.writeByte(kinds.length);
+			var src = haxe.io.Path.normalize(FileSystem.absolutePath(file));
+			var srcBytes = Bytes.ofString(src);
+			out.writeUInt16(srcBytes.length);
+			out.write(srcBytes);
+			for (kind in kinds) part.copyKind(kind, out);
+			out.close();
 		}
-		out.close();
-		if (FileSystem.exists(path)) FileSystem.deleteFile(path);
-		FileSystem.rename(tmp, path);
+		catch (e:Dynamic)
+		{
+			out.close();
+			try FileSystem.deleteFile(tmp) catch (e2:Dynamic) {}
+			throw e;
+		}
+		var tries = 0;
+		while (true)
+		{
+			try
+			{
+				if (FileSystem.exists(path)) FileSystem.deleteFile(path);
+				FileSystem.rename(tmp, path);
+				break;
+			}
+			catch (e:Dynamic)
+			{
+				if (++tries >= 20)
+				{
+					try FileSystem.deleteFile(tmp) catch (e2:Dynamic) {}
+					throw e;
+				}
+				Sys.sleep(0.1);
+			}
+		}
 	}
 
 	@:access(openfl.display.BitmapData)
@@ -672,14 +908,17 @@ class Payload
 	public var width:Int;
 	public var height:Int;
 	public var total:Int;
+	public var scale:Int;
+	public var reserved:Float = 0;
 	public var levels:Array<Bytes> = [];
 
-	public function new(file:String, width:Int, height:Int, total:Int)
+	public function new(file:String, width:Int, height:Int, total:Int, scale:Int)
 	{
 		this.file = file;
 		this.width = width;
 		this.height = height;
 		this.total = total;
+		this.scale = scale;
 	}
 }
 
@@ -690,39 +929,248 @@ private class Owned
 	public var height:Int;
 	public var total:Int;
 	public var loaded:Int;
+	public var scale:Int;
 
-	public function new(file:String, width:Int, height:Int, total:Int, loaded:Int)
+	public function new(file:String, width:Int, height:Int, total:Int, loaded:Int, scale:Int)
 	{
 		this.file = file;
 		this.width = width;
 		this.height = height;
 		this.total = total;
 		this.loaded = loaded;
+		this.scale = scale;
 	}
 }
 
 private class Task
 {
-	public var encoder:BC7Encoder;
 	public var rgba:Bytes;
 	public var width:Int;
 	public var height:Int;
-	public var out:Bytes;
 	public var from:Int;
 	public var to:Int;
 	public var done:Lock;
+	public var check:Bool;
+	public var enhance:Bool;
+	public var index:Int = 0;
+	public var out:Bytes;
 	public var failed:Bool = false;
+	public var sse:Float = 0;
+	public var counted:Float = 0;
+	public var bad:Float = 0;
+	public var bpSse:Float = 0;
+	public var bpCounted:Float = 0;
 
-	public function new(encoder:BC7Encoder, rgba:Bytes, width:Int, height:Int, out:Bytes, from:Int, to:Int, done:Lock)
+	public function new(rgba:Bytes, width:Int, height:Int, from:Int, to:Int, done:Lock, check:Bool, enhance:Bool)
 	{
-		this.encoder = encoder;
 		this.rgba = rgba;
 		this.width = width;
 		this.height = height;
-		this.out = out;
 		this.from = from;
 		this.to = to;
 		this.done = done;
+		this.check = check;
+		this.enhance = enhance;
+	}
+}
+
+private class Record
+{
+	public var kind:Int = 0;
+	public var index:Int = 0;
+	public var raw:Int = 0;
+	public var zlen:Int = 0;
+	public var offset:Int = 0;
+	public var sse:Float = 0;
+	public var counted:Float = 0;
+	public var bad:Float = 0;
+	public var bpSse:Float = 0;
+	public var bpCounted:Float = 0;
+
+	public function new() {}
+}
+
+private class Partial
+{
+	static inline var MAGIC:Int = 0x50505856;
+	static inline var HEADER:Int = 30;
+	static inline var RECORD:Int = 53;
+
+	var path:String;
+	var out:sys.io.FileOutput;
+	var size:Int = 0;
+	var kinds:Map<Int, Map<Int, Record>> = [];
+
+	public function new(path:String, info:Array<Float>, w:Int, h:Int, enh:Bool)
+	{
+		this.path = path;
+		var ok = false;
+		if (FileSystem.exists(path))
+		{
+			try
+			{
+				var total = FileSystem.stat(path).size;
+				var input = File.read(path, true);
+				var good = input.readInt32() == MAGIC && input.readByte() == VortexPixel.VERSION && input.readDouble() == info[0]
+					&& input.readDouble() == info[1] && input.readInt32() == w && input.readInt32() == h && input.readByte() == (enh ? 1 : 0);
+				var pos = HEADER;
+				if (good)
+				{
+					while (pos + RECORD <= total)
+					{
+						var r = new Record();
+						r.kind = input.readByte();
+						r.index = input.readInt32();
+						r.raw = input.readInt32();
+						r.zlen = input.readInt32();
+						r.sse = input.readDouble();
+						r.counted = input.readDouble();
+						r.bad = input.readDouble();
+						r.bpSse = input.readDouble();
+						r.bpCounted = input.readDouble();
+						r.offset = pos + RECORD;
+						if (r.offset + r.zlen > total) break;
+						input.seek(r.zlen, SeekCur);
+						pos = r.offset + r.zlen;
+						keep(r);
+					}
+				}
+				input.close();
+				ok = good && pos == total;
+				size = pos;
+			}
+			catch (e:Dynamic)
+			{
+				ok = false;
+			}
+		}
+		if (ok)
+		{
+			out = File.append(path, true);
+			return;
+		}
+		kinds = [];
+		out = File.write(path, true);
+		out.writeInt32(MAGIC);
+		out.writeByte(VortexPixel.VERSION);
+		out.writeDouble(info[0]);
+		out.writeDouble(info[1]);
+		out.writeInt32(w);
+		out.writeInt32(h);
+		out.writeByte(enh ? 1 : 0);
+		out.flush();
+		size = HEADER;
+	}
+
+	function keep(r:Record):Void
+	{
+		var map = kinds.get(r.kind);
+		if (map == null)
+		{
+			map = new Map();
+			kinds.set(r.kind, map);
+		}
+		map.set(r.index, r);
+	}
+
+	public function has(kind:Int, index:Int):Bool
+	{
+		var map = kinds.get(kind);
+		return map != null && map.exists(index);
+	}
+
+	public function count(kind:Int):Int
+	{
+		var map = kinds.get(kind);
+		var n = 0;
+		if (map != null) for (r in map) n++;
+		return n;
+	}
+
+	public function add(kind:Int, index:Int, data:Bytes, sse:Float, counted:Float, bad:Float, bpSse:Float, bpCounted:Float):Void
+	{
+		var z = haxe.zip.Compress.run(data, 3);
+		var r = new Record();
+		r.kind = kind;
+		r.index = index;
+		r.raw = data.length;
+		r.zlen = z.length;
+		r.sse = sse;
+		r.counted = counted;
+		r.bad = bad;
+		r.bpSse = bpSse;
+		r.bpCounted = bpCounted;
+		out.writeByte(kind);
+		out.writeInt32(index);
+		out.writeInt32(r.raw);
+		out.writeInt32(r.zlen);
+		out.writeDouble(sse);
+		out.writeDouble(counted);
+		out.writeDouble(bad);
+		out.writeDouble(bpSse);
+		out.writeDouble(bpCounted);
+		out.write(z);
+		out.flush();
+		r.offset = size + RECORD;
+		size = r.offset + r.zlen;
+		keep(r);
+	}
+
+	public function stats(kind:Int):Array<Float>
+	{
+		var sse = 0.0, counted = 0.0, bad = 0.0, bpSse = 0.0, bpCounted = 0.0;
+		var map = kinds.get(kind);
+		if (map != null) for (r in map)
+		{
+			sse += r.sse;
+			counted += r.counted;
+			bad += r.bad;
+			bpSse += r.bpSse;
+			bpCounted += r.bpCounted;
+		}
+		inline function db(e:Float, n:Float):Float
+			return n > 0 && e > 0 ? 10 * Math.log(65025 / (e / (n * 4))) / Math.log(10) : 99;
+		return [db(sse, counted), counted > 0 ? bad / counted : 0, db(bpSse, bpCounted)];
+	}
+
+	public function copyKind(kind:Int, dest:haxe.io.Output):Void
+	{
+		out.flush();
+		var map = kinds.get(kind);
+		var list = map == null ? [] : [for (r in map) r];
+		list.sort((a, b) -> a.index - b.index);
+		var total = 0;
+		for (r in list) total += r.raw;
+		dest.writeInt32(total);
+		dest.writeInt32(list.length);
+		var input = File.read(path, true);
+		try
+		{
+			for (r in list)
+			{
+				input.seek(r.offset, SeekBegin);
+				dest.writeInt32(r.raw);
+				dest.writeInt32(r.zlen);
+				dest.write(input.read(r.zlen));
+			}
+		}
+		catch (e:Dynamic)
+		{
+			input.close();
+			throw e;
+		}
+		input.close();
+	}
+
+	public function close():Void
+	{
+		try out.close() catch (e:Dynamic) {}
+	}
+
+	public function remove():Void
+	{
+		close();
+		try FileSystem.deleteFile(path) catch (e:Dynamic) {}
 	}
 }
 

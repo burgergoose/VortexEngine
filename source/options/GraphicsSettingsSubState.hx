@@ -53,8 +53,14 @@ class GraphicsSettingsSubState extends BaseOptionsMenu
 		addOption(option);
 
 		var option:Option = new Option('VortexPixel',
-			"If checked, big pictures are compressed on the GPU (BC7). They use about 4x less memory\nand load faster after the first time. Needs GPU Caching.",
+			"If checked, sprites get cached on the GPU in a smaller format (BC7) after the first time\nyou see them, so they load faster. Needs GPU Caching.",
 			'vortexPixel',
+			BOOL);
+		addOption(option);
+
+		var option:Option = new Option('VortexPixel Enhance',
+			"If checked, VortexPixel goes over every pixel of a sprite and makes a sharper 2x version\n(same colours and outlines). Shows when sprites are zoomed in or fullscreen. Builds in menus.",
+			'vortexEnhance',
 			BOOL);
 		addOption(option);
 

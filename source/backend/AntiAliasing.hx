@@ -169,8 +169,9 @@ class AntiAliasing
 		for (graphic => entry in entries)
 		{
 			if (graphic.isDestroyed) continue;
-			if (on && (!entry.ready || outdated(graphic, entry))) build(graphic, entry);
-			graphic.shader.bitmap.mipFilter = (on && entry.ready) ? MIPLINEAR : MIPNONE;
+			var want:Bool = on || enhanced(graphic);
+			if (want && (!entry.ready || outdated(graphic, entry))) build(graphic, entry);
+			graphic.shader.bitmap.mipFilter = (want && entry.ready) ? MIPLINEAR : MIPNONE;
 		}
 	}
 
@@ -179,7 +180,7 @@ class AntiAliasing
 		if (!init() || !mipmapsSupported || graphic == null || graphic.bitmap == null || entries.exists(graphic)) return;
 		var entry = new MipmapEntry();
 		entries.set(graphic, entry);
-		if (mipmapsActive)
+		if (mipmapsActive || enhanced(graphic))
 		{
 			build(graphic, entry);
 			graphic.shader.bitmap.mipFilter = entry.ready ? MIPLINEAR : MIPNONE;
@@ -194,7 +195,7 @@ class AntiAliasing
 		var shader = quads.shader != null ? quads.shader : graphic.shader;
 		if (shader == null || shader.bitmap == null) return;
 		if (shader != graphic.shader && !Std.isOfType(shader, RGBPaletteShader)) return;
-		var entry:MipmapEntry = mipmapsActive ? entries.get(graphic) : null;
+		var entry:MipmapEntry = (mipmapsActive || enhanced(graphic)) ? entries.get(graphic) : null;
 		var smooth:Bool = camera.antialiasing || quads.antialiasing;
 		shader.bitmap.mipFilter = (entry != null && entry.ready && smooth) ? MIPLINEAR : MIPNONE;
 	}
@@ -211,7 +212,7 @@ class AntiAliasing
 				gone.push(graphic);
 				continue;
 			}
-			if (mipmapsActive && outdated(graphic, entry))
+			if ((mipmapsActive || enhanced(graphic)) && outdated(graphic, entry))
 			{
 				build(graphic, entry);
 				graphic.shader.bitmap.mipFilter = entry.ready ? MIPLINEAR : MIPNONE;
@@ -219,6 +220,9 @@ class AntiAliasing
 		}
 		if (gone != null) for (graphic in gone) entries.remove(graphic);
 	}
+
+	static function enhanced(graphic:FlxGraphic):Bool
+		return graphic.bitmap != null && backend.pixel.VortexPixel.isEnhanced(graphic.bitmap.__texture);
 
 	static function outdated(graphic:FlxGraphic, entry:MipmapEntry):Bool
 	{

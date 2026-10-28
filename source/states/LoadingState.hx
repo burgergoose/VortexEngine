@@ -857,7 +857,7 @@ class LoadingState extends MusicBeatState
 				var file:String = Paths.getPath(requestKey, IMAGE);
 				if (#if sys FileSystem.exists(file) || #end OpenFlAssets.exists(file, IMAGE))
 				{
-					var payload = ClientPrefs.data.cacheOnGPU ? backend.pixel.VortexPixel.readCached(file, backend.AntiAliasing.mipmapsActive) : null;
+					var payload = ClientPrefs.data.cacheOnGPU ? backend.pixel.VortexPixel.readCached(file, backend.AntiAliasing.mipmapsActive, true) : null;
 					if (payload != null)
 					{
 						mutex.acquire();
