@@ -1,0 +1,42 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  buildWindows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: krdlab/setup-haxe@v1
+        with:
+          haxe-version: 4.3.7
+
+      - name: Install libraries
+        run: |
+          haxelib setup C:/haxelib
+          haxelib install hxcpp 4.3.2 --quiet
+          echo.| "setup\windows.bat"
+        shell: cmd
+
+      - name: Compile check
+        run: |
+          haxelib run lime display windows > check.hxml
+          haxe check.hxml
+        shell: cmd
+
+      - name: Build
+        run: haxelib run lime build windows -release
+        shell: cmd
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: VortexEngine-windows
+          path: export/release/windows/bin

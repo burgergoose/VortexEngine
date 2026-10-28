@@ -1,0 +1,1 @@
+Example event, it just prints value 1 and value 2.
