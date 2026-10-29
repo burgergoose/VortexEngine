@@ -73,7 +73,7 @@ class Main extends Sprite
 		{
 			if (__bootLog == null)
 				__bootLog = sys.io.File.append("vortex_boot_log.txt", false);
-			__bootLog.writeString(Date.now().toString() + " - " + msg + "\n");
+			__bootLog.writeString(Date.now().toString() + " - " + msg + " (" + Math.round(backend.ProcessInfo.memory() / 1048576) + " MB)\n");
 			__bootLog.flush();
 		}
 		catch (e:Dynamic) {}
@@ -116,7 +116,10 @@ class Main extends Sprite
 		Sys.setCwd(lime.system.System.applicationStorageDirectory);
 		#end
 		#if VIDEOS_ALLOWED
-		hxvlc.util.Handle.init(#if (hxvlc >= "1.8.0")  ['--no-lua'] #end);
+		sys.thread.Thread.create(function() {
+			try { hxvlc.util.Handle.init(#if (hxvlc >= "1.8.0")  ['--no-lua'] #end); } catch (e:Dynamic) { trace('Video player could not start: $e'); }
+		});
+		checkpoint("video player starting");
 		#end
 
 		#if LUA_ALLOWED

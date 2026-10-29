@@ -59,7 +59,7 @@ class GraphicsSettingsSubState extends BaseOptionsMenu
 		addOption(option);
 
 		var option:Option = new Option('VortexPixel Enhance',
-			"If checked, VortexPixel goes over every pixel of a sprite and makes a sharper 2x version\n(same colours and outlines). Shows when sprites are zoomed in or fullscreen. Builds in menus.",
+			"If checked, VortexPixel goes over every pixel of a sprite and makes a sharper 2x version\n(same colours and outlines). Only used when sprites are drawn 1.6x bigger or more. Uses more RAM.",
 			'vortexEnhance',
 			BOOL);
 		addOption(option);

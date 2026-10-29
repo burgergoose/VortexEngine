@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <project>
 
-	<app title="Friday Night Funkin': Vortex Engine" file="VortexEngine" packageName="com.vortexengine.game" package="com.vortexengine.game" main="Main" version="1.1.3" company="Vortex Engine" />
+	<app title="Friday Night Funkin': Vortex Engine" file="VortexEngine" packageName="com.vortexengine.game" package="com.vortexengine.game" main="Main" version="1.1.4" company="Vortex Engine" />
 
 	<set name="APP_ID" value="0x0100f6c013bbc000" />
 

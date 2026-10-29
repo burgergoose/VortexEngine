@@ -3,7 +3,7 @@ package backend;
 class VortexConfig
 {
 	public static var engineName(default, null):String = "Vortex Engine";
-	public static var engineVersion(default, null):String = "1.1.3";
+	public static var engineVersion(default, null):String = "1.1.4";
 
 	public static var discordAppId(default, null):String = "0";
 

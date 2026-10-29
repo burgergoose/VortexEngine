@@ -21,6 +21,7 @@ class Enhance
 	var up:Bytes;
 	var res:Vector<Int>;
 	var zero:Bytes;
+	var bandOut:Bytes;
 
 	public function new()
 	{
@@ -358,8 +359,10 @@ class Enhance
 			}
 		}
 
-		var out = Bytes.alloc((y1 - y0) * 2 * w2 * 4);
-		out.blit(0, this.up, (y0 - ry0) * 2 * w2 * 4, out.length);
+		var size = (y1 - y0) * 2 * w2 * 4;
+		if (bandOut == null || bandOut.length < size) bandOut = Bytes.alloc(size);
+		var out = bandOut;
+		out.blit(0, this.up, (y0 - ry0) * 2 * w2 * 4, size);
 		for (y in y0...y1)
 		{
 			var r = y - ry0;

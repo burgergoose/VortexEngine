@@ -72,7 +72,7 @@ class AntiAliasing
 			trace('Anti-aliasing: could not read the GPU settings: $e');
 		}
 		FlxG.signals.postDraw.add(checkMipmaps);
-		FlxG.signals.postDraw.addOnce(backend.pixel.VortexPixel.init);
+		backend.pixel.VortexPixel.init();
 		return true;
 	}
 

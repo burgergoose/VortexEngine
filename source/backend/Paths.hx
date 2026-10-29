@@ -254,7 +254,7 @@ class Paths
 		return returnSound('sounds/$key', modsAllowed);
 
 	inline static public function music(key:String, ?modsAllowed:Bool = true):Sound
-		return returnSound('music/$key', modsAllowed);
+		return returnSound('music/$key', null, modsAllowed, true, true);
 
 	static public function instFile(song:String):Null<String>
 	{

@@ -20,7 +20,7 @@ class VortexPixel
 {
 	public static inline var VERSION:Int = 3;
 	public static inline var MIN_PIXELS:Int = 64 * 64;
-	public static inline var SHARP_AT:Float = 1.15;
+	public static inline var SHARP_AT:Float = 1.6;
 	public static inline var DROP_AFTER:Float = 15;
 	public static inline var MIN_PSNR:Float = 44;
 	public static inline var MAX_BAD:Float = 0.005;
@@ -808,14 +808,15 @@ class VortexPixel
 					ProcessInfo.lowPriorityThread();
 					var encoder = new BC7Encoder();
 					var enhancer = new Enhance();
+					var scratch = new Scratch();
 					while (true)
 					{
 						var t = tasks.pop(true);
 						try
 						{
-							runTask(t, encoder, enhancer);
+							runTask(t, encoder, enhancer, scratch);
 							t.raw = t.out.length;
-							t.out = haxe.zip.Compress.run(t.out, 3);
+							t.out = scratch.compress(t.out);
 						}
 						catch (e:Dynamic)
 						{
@@ -860,7 +861,7 @@ class VortexPixel
 		}
 	}
 
-	static function runTask(t:Task, encoder:BC7Encoder, enhancer:Enhance):Void
+	static function runTask(t:Task, encoder:BC7Encoder, enhancer:Enhance, scratch:Scratch):Void
 	{
 		encoder.sse = 0;
 		encoder.counted = 0;
@@ -874,7 +875,7 @@ class VortexPixel
 			var band = enhancer.band(t.rgba, t.width, t.height, t.from, t.to);
 			var bh = (t.to - t.from) * 2;
 			var blocks = (bh + 3) >> 2;
-			t.out = Bytes.alloc(BC7.blocksSize(t.width * 2, bh));
+			t.out = scratch.raw(BC7.blocksSize(t.width * 2, bh));
 			encoder.encodeRows(band, t.width * 2, bh, t.out, 0, 0, blocks, pausePoint);
 			t.bpSse = enhancer.sse;
 			t.bpCounted = enhancer.counted;
@@ -882,7 +883,7 @@ class VortexPixel
 		else
 		{
 			var bw = (t.width + 3) >> 2;
-			t.out = Bytes.alloc((t.to - t.from) * bw * 16);
+			t.out = scratch.raw((t.to - t.from) * bw * 16);
 			encoder.encodeRows(t.rgba, t.width, t.height, t.out, -t.from * bw * 16, t.from, t.to, pausePoint);
 		}
 		t.sse = encoder.sse;
@@ -931,6 +932,7 @@ class VortexPixel
 			{
 				var prev = mipSizes[images.length - 1];
 				images.push(BC7.halve(images[images.length - 1], prev[0], prev[1]));
+				if (images.length > 2) images[images.length - 2] = null;
 			}
 			var size = mipSizes[level];
 			var bh = (size[1] + 3) >> 2;
@@ -1290,6 +1292,32 @@ private class Piece
 		this.width = width;
 		this.data = data;
 		this.len = len;
+	}
+}
+
+private class Scratch
+{
+	var buffer:Bytes;
+	var zbuf:Bytes;
+
+	public function new() {}
+
+	public function raw(size:Int):Bytes
+	{
+		if (buffer == null || buffer.length != size) buffer = Bytes.alloc(size);
+		return buffer;
+	}
+
+	public function compress(src:Bytes):Bytes
+	{
+		var bound = src.length + (src.length >> 10) + 128;
+		if (zbuf == null || zbuf.length < bound) zbuf = Bytes.alloc(bound);
+		var z = new haxe.zip.Compress(3);
+		z.setFlushMode(haxe.zip.FlushMode.FINISH);
+		var r = z.execute(src, 0, zbuf, 0);
+		z.close();
+		if (!r.done || r.read != src.length) return haxe.zip.Compress.run(src, 3);
+		return zbuf.sub(0, r.write);
 	}
 }
 

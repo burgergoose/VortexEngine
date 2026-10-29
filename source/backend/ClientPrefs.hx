@@ -22,7 +22,7 @@ import states.TitleState;
 	public var shaders:Bool = true;
 	public var cacheOnGPU:Bool = true; // GPU Caching made by Raltyro
 	public var vortexPixel:Bool = true;
-	public var vortexEnhance:Bool = true;
+	public var vortexEnhance:Bool = false;
 	public var streamAudio:Bool = true;
 	public var framerate:Int = 60;
 	public var camZooms:Bool = true;
@@ -175,6 +175,10 @@ class ClientPrefs {
 		if(FlxG.save.data.cacheOnGPUDefaulted == null) {
 			data.cacheOnGPU = FlxG.save.data.cacheOnGPU = true;
 			FlxG.save.data.cacheOnGPUDefaulted = true;
+		}
+		if(FlxG.save.data.vortexEnhanceDefaulted == null) {
+			data.vortexEnhance = FlxG.save.data.vortexEnhance = false;
+			FlxG.save.data.vortexEnhanceDefaulted = true;
 		}
 
 		if(Main.fpsVar != null)
