@@ -238,6 +238,10 @@ class Main extends Sprite
 		FlxG.game.focusLostFramerate = 60;
 		FlxG.keys.preventDefaultKeys = [TAB];
 
+		backend.ProcessInfo.setFocused(true);
+		FlxG.signals.focusGained.add(function() backend.ProcessInfo.setFocused(true));
+		FlxG.signals.focusLost.add(function() backend.ProcessInfo.setFocused(false));
+
 		#if DISCORD_ALLOWED
 		DiscordClient.prepare();
 		#end

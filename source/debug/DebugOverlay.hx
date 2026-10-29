@@ -62,7 +62,7 @@ class DebugOverlay extends TextField
 	{
 		var lines:Array<String> = [];
 		lines.push('${VortexConfig.engineName} v${VortexConfig.engineVersion} -- Developer Mode (F3 to hide)');
-		lines.push('FPS: ${Main.fpsVar != null ? Main.fpsVar.currentFPS : 0}  |  Memory: ${flixel.util.FlxStringUtil.formatBytes(FPSCounter.getMemoryBytes())}');
+		lines.push('FPS: ${Main.fpsVar != null ? Main.fpsVar.currentFPS : 0} (lowest ${Main.fpsVar != null ? Main.fpsVar.lowestFPS : 0})  |  Memory: ${flixel.util.FlxStringUtil.formatBytes(backend.ProcessInfo.memory())} (game heap ${flixel.util.FlxStringUtil.formatBytes(FPSCounter.getMemoryBytes())})');
 
 		if (inPlayState())
 		{

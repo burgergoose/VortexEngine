@@ -8,6 +8,7 @@ import openfl.system.System;
 class FPSCounter extends TextField
 {
 	public var currentFPS(default, null):Int;
+	public var lowestFPS(default, null):Int;
 
 	public var memoryMegas(get, never):Float;
 
@@ -21,6 +22,7 @@ class FPSCounter extends TextField
 		this.y = y;
 
 		currentFPS = 0;
+		lowestFPS = 0;
 		selectable = false;
 		mouseEnabled = false;
 		defaultTextFormat = new TextFormat("_sans", 14, color);
@@ -43,7 +45,11 @@ class FPSCounter extends TextField
 			return;
 		}
 
-		currentFPS = times.length < FlxG.updateFramerate ? times.length : FlxG.updateFramerate;		
+		currentFPS = times.length < FlxG.updateFramerate ? times.length : FlxG.updateFramerate;
+		var worst = times.length > 0 ? now - times[times.length - 1] : 0.0;
+		for (i in 1...times.length)
+			if (times[i] - times[i - 1] > worst) worst = times[i] - times[i - 1];
+		lowestFPS = worst > 0 ? Std.int(Math.min(currentFPS, 1000 / worst)) : currentFPS;
 		updateText();
 		deltaTimeout = 0.0;
 	}
@@ -58,7 +64,10 @@ class FPSCounter extends TextField
 	}
 
 	inline function get_memoryMegas():Float
-		return getMemoryBytes();
+	{
+		var bytes = backend.ProcessInfo.memory();
+		return bytes > 0 ? bytes : getMemoryBytes();
+	}
 
 	public static inline function getMemoryBytes():Float
 		#if cpp

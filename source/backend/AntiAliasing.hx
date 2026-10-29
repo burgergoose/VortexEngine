@@ -213,9 +213,15 @@ class AntiAliasing
 		var n = t.length;
 		while (i + 3 < n)
 		{
-			var det = t[i] * t[i + 3] - t[i + 1] * t[i + 2];
-			if (det < 0) det = -det;
-			if (det > best) best = det;
+			var a = t[i];
+			var b = t[i + 1];
+			var c = t[i + 2];
+			var d = t[i + 3];
+			var sum = a * a + b * b + c * c + d * d;
+			var det = a * d - b * c;
+			var gap = sum * sum - 4 * det * det;
+			var low = (sum - Math.sqrt(gap > 0 ? gap : 0)) * 0.5;
+			if (low > best) best = low;
 			i += 6;
 		}
 		return Math.sqrt(best) * camera.totalScaleX;

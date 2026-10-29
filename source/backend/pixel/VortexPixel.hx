@@ -62,9 +62,15 @@ class VortexPixel
 	static var owned:Map<TextureBase, Owned> = new Map();
 	static var sharpJobs:Deque<Sharp>;
 	static var sharpDone:Deque<Sharp>;
+	static var spare:Deque<Bytes>;
+	static var current:Sharp;
+	static var streamZ:Bytes;
+	static var streamSwaps:Bool = false;
+	static inline var SWAP_BYTES:Int = 2 * 1048576;
 	public static var sharpened(default, null):Int = 0;
 	public static var lastSharp(default, null):String = '';
 	public static var dropped(default, null):Int = 0;
+	public static var swapError(default, null):String = '';
 	static var lastDropCheck:Float = 0;
 	static var budgetMutex:Mutex = new Mutex();
 	static var inFlight:Float = 0;
@@ -95,6 +101,7 @@ class VortexPixel
 			var major = Std.parseInt(nums[0]);
 			var minor = nums.length > 1 ? Std.parseInt(nums[1]) : 0;
 			if (major != null && minor != null && (major > 4 || (major == 4 && minor >= 2))) bptc = true;
+			streamSwaps = major != null && minor != null && (major > 4 || (major == 4 && minor >= 2));
 			if (!bptc)
 			{
 				status = 'off (this GPU has no BC7)';
@@ -225,15 +232,11 @@ class VortexPixel
 			var upgrade = false;
 			try
 			{
-				if (input.readInt32() != MAGIC || input.readByte() != VERSION) throw 'old';
-				var flags = input.readByte();
-				var size = input.readDouble();
-				var time = input.readDouble();
-				var w = input.readInt32();
-				var h = input.readInt32();
-				var levels = input.readByte();
-				var src = input.readString(input.readUInt16());
-				if (size != info[0] || time != info[1] || src != haxe.io.Path.normalize(FileSystem.absolutePath(file))) throw 'changed';
+				var head = header(input, file, info);
+				var flags = head[0];
+				var w = head[1];
+				var h = head[2];
+				var levels = head[3];
 				if (flags & 1 == 1)
 				{
 					mutex.acquire();
@@ -319,6 +322,45 @@ class VortexPixel
 		p.reserved = 0;
 	}
 
+	static function header(input:sys.io.FileInput, file:String, info:Array<Float>):Array<Int>
+	{
+		if (info == null) throw 'gone';
+		if (input.readInt32() != MAGIC || input.readByte() != VERSION) throw 'old';
+		var flags = input.readByte();
+		var size = input.readDouble();
+		var time = input.readDouble();
+		var w = input.readInt32();
+		var h = input.readInt32();
+		var levels = input.readByte();
+		var src = input.readString(input.readUInt16());
+		if (size != info[0] || time != info[1] || src != haxe.io.Path.normalize(FileSystem.absolutePath(file))) throw 'changed';
+		return [flags, w, h, levels];
+	}
+
+	static function inflate(z:Bytes, zlen:Int, out:Bytes, pos:Int, raw:Int):Void
+	{
+		var u = new haxe.zip.Uncompress();
+		var read = 0;
+		var wrote = 0;
+		try
+		{
+			while (wrote < raw && read < zlen)
+			{
+				var r = u.execute(z, read, out, pos + wrote);
+				read += r.read;
+				wrote += r.write;
+				if (r.done || (r.read == 0 && r.write == 0)) break;
+			}
+		}
+		catch (e:Dynamic)
+		{
+			u.close();
+			throw e;
+		}
+		u.close();
+		if (wrote != raw) throw 'bad chunk';
+	}
+
 	static function readLevel(input:sys.io.FileInput, discard:Bool):Bytes
 	{
 		var total = input.readInt32();
@@ -338,26 +380,7 @@ class VortexPixel
 			if (zbuf == null || zbuf.length < zlen) zbuf = Bytes.alloc(zlen + (zlen >> 2));
 			input.readFullBytes(zbuf, 0, zlen);
 			if (pos + raw > total) throw 'long level';
-			var u = new haxe.zip.Uncompress();
-			var read = 0;
-			var wrote = 0;
-			try
-			{
-				while (wrote < raw)
-				{
-					var r = u.execute(zbuf, read, data, pos + wrote);
-					read += r.read;
-					wrote += r.write;
-					if (r.done || (r.read == 0 && r.write == 0)) break;
-				}
-			}
-			catch (e:Dynamic)
-			{
-				u.close();
-				throw e;
-			}
-			u.close();
-			if (wrote != raw) throw 'bad chunk';
+			inflate(zbuf, zlen, data, pos, raw);
 			pos += raw;
 		}
 		if (!discard && pos != total) throw 'short level';
@@ -506,27 +529,100 @@ class VortexPixel
 
 	static function queueSharp(job:Sharp):Void
 	{
+		if (!streamSwaps) return;
 		if (sharpJobs == null)
 		{
 			sharpJobs = new Deque<Sharp>();
 			sharpDone = new Deque<Sharp>();
+			spare = new Deque<Bytes>();
+			for (i in 0...4) spare.add(Bytes.alloc(0));
 			Thread.create(function() {
+				ProcessInfo.lowPriorityThread();
 				while (true)
 				{
 					var job = sharpJobs.pop(true);
-					try
-					{
-						job.payload = readCached(job.file, true, false, !job.down);
-					}
-					catch (e:Dynamic)
-					{
-						job.payload = null;
-					}
 					sharpDone.add(job);
+					stream(job);
 				}
 			});
 		}
 		sharpJobs.add(job);
+	}
+
+	static function stream(job:Sharp):Void
+	{
+		var input:sys.io.FileInput = null;
+		var ok = false;
+		try
+		{
+			input = File.read(cacheFile(job.file), true);
+			var head = header(input, job.file, sourceInfo(job.file));
+			if (head[0] & 1 == 1 || head[0] & 2 != 2 || !ClientPrefs.data.vortexEnhance) throw 'plain';
+			var skip = job.down ? 1 : 0;
+			job.scale = job.down ? 1 : 2;
+			job.width = head[1];
+			job.height = head[2];
+			job.levels = head[3] - skip;
+			for (i in 0...skip) readLevel(input, true);
+			for (l in 0...job.levels)
+			{
+				var lw = (job.width * job.scale) >> l;
+				var lh = (job.height * job.scale) >> l;
+				if (lw < 1) lw = 1;
+				if (lh < 1) lh = 1;
+				var rowBytes = ((lw + 3) >> 2) * 16;
+				var total = input.readInt32();
+				var chunks = input.readInt32();
+				if (total != BC7.blocksSize(lw, lh)) throw 'size';
+				var whole = (lw & 3) != 0 || (lh & 3) != 0 ? Bytes.alloc(total) : null;
+				var pos = 0;
+				for (c in 0...chunks)
+				{
+					var raw = input.readInt32();
+					var zlen = input.readInt32();
+					if (streamZ == null || streamZ.length < zlen) streamZ = Bytes.alloc(zlen + (zlen >> 2));
+					input.readFullBytes(streamZ, 0, zlen);
+					if (pos + raw > total || pos % rowBytes != 0 || (raw % rowBytes != 0 && pos + raw != total)) throw 'chunk';
+					if (whole != null)
+					{
+						inflate(streamZ, zlen, whole, pos, raw);
+						pos += raw;
+						continue;
+					}
+					var buf = spare.pop(true);
+					if (buf.length < raw) buf = Bytes.alloc(raw);
+					try
+					{
+						inflate(streamZ, zlen, buf, 0, raw);
+					}
+					catch (e:Dynamic)
+					{
+						spare.add(buf);
+						throw e;
+					}
+					var piece = new Piece(l, Std.int(pos / rowBytes) * 4, lw, buf, raw);
+					var bottom = Std.int((pos + raw + rowBytes - 1) / rowBytes) * 4;
+					piece.rows = (bottom > lh ? lh : bottom) - piece.y;
+					job.pieces.add(piece);
+					pos += raw;
+				}
+				if (pos != total) throw 'short';
+				if (whole != null)
+				{
+					var piece = new Piece(l, 0, lw, whole, total);
+					piece.rows = lh;
+					piece.pooled = false;
+					job.pieces.add(piece);
+				}
+			}
+			ok = true;
+		}
+		catch (e:Dynamic)
+		{
+			swapError = haxe.io.Path.withoutDirectory(job.file) + ': ' + Std.string(e);
+		}
+		if (input != null) input.close();
+		job.pieces.add(new Piece(ok ? -1 : -2, 0, 0, null, 0));
 	}
 
 	@:access(openfl.display3D.textures.TextureBase)
@@ -549,46 +645,99 @@ class VortexPixel
 	{
 		if (sharpDone == null) return;
 		checkDrops();
-		var job = sharpDone.pop(false);
+		if (current == null) current = sharpDone.pop(false);
+		var job = current;
 		if (job == null) return;
-		var p = job.payload;
 		var entry = owned.get(job.texture);
-		var want = job.down ? 1 : 2;
-		if (p == null || p.scale != want || entry == null || job.texture.__textureID == null || p.width != entry.width || p.height != entry.height)
-		{
-			if (entry != null)
-			{
-				if (job.down) entry.lastBig = Sys.time();
-				else entry.later = false;
-				entry.dropping = false;
-			}
-			return;
-		}
+		var alive = entry != null && job.texture.__textureID != null;
 		var context = Lib.current.stage.context3D;
 		var gl = context.gl;
-		var guard = 0;
-		while (gl.getError() != gl.NO_ERROR && guard++ < 16) {}
-		context.__bindGLTexture2D(job.texture.__textureID);
-		sendLevels(gl, p, 0);
-		gl.texParameteri(gl.TEXTURE_2D, TEXTURE_MAX_LEVEL, p.levels.length - 1);
-		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, p.levels.length > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
-		gl.texParameterf(gl.TEXTURE_2D, TEXTURE_LOD_BIAS, AntiAliasing.mipmapBias);
-		var ok = gl.getError() == gl.NO_ERROR;
-		context.__bindGLTexture2D(null);
-		entry.dropping = false;
+		var spent = 0;
+		var started = haxe.Timer.stamp();
+		while (true)
+		{
+			var piece = job.pieces.pop(false);
+			if (piece == null) break;
+			if (piece.level < 0)
+			{
+				finishSwap(job, entry, alive && !job.broken && piece.level == -1);
+				current = null;
+				break;
+			}
+			if (alive && !job.broken)
+			{
+				var guard = 0;
+				while (gl.getError() != gl.NO_ERROR && guard++ < 16) {}
+				if (job.glTexture == null)
+				{
+					job.glTexture = gl.createTexture();
+					context.__bindGLTexture2D(job.glTexture);
+					var gl2:lime.graphics.WebGL2RenderContext = cast gl;
+					gl2.texStorage2D(gl.TEXTURE_2D, job.levels, BPTC, job.width * job.scale, job.height * job.scale);
+				}
+				else context.__bindGLTexture2D(job.glTexture);
+				gl.compressedTexSubImage2D(gl.TEXTURE_2D, piece.level, 0, piece.y, piece.width, piece.rows, BPTC, UInt8Array.fromBytes(piece.data, 0, piece.len));
+				var error = gl.getError();
+				if (error != gl.NO_ERROR)
+				{
+					job.broken = true;
+					swapError = haxe.io.Path.withoutDirectory(job.file) + ': GL error ' + error + ' on level ' + piece.level + ' rows ' + piece.y + '+' + piece.rows;
+				}
+				context.__bindGLTexture2D(null);
+			}
+			spent += piece.len;
+			if (piece.pooled) spare.add(piece.data);
+			piece.data = null;
+			if (spent >= SWAP_BYTES || haxe.Timer.stamp() - started > 0.003) break;
+		}
+	}
+
+	@:access(openfl.display3D.Context3D)
+	@:access(openfl.display3D.textures.TextureBase)
+	static function finishSwap(job:Sharp, entry:Owned, ok:Bool):Void
+	{
+		var context = Lib.current.stage.context3D;
+		var gl = context.gl;
+		if (ok && (job.glTexture == null || job.width != entry.width || job.height != entry.height)) ok = false;
 		if (ok)
 		{
-			entry.scale = want;
-			entry.total = p.total;
-			entry.loaded = p.levels.length;
+			var guard = 0;
+			while (gl.getError() != gl.NO_ERROR && guard++ < 16) {}
+			context.__bindGLTexture2D(job.glTexture);
+			gl.texParameteri(gl.TEXTURE_2D, TEXTURE_MAX_LEVEL, job.levels - 1);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, job.levels > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+			gl.texParameterf(gl.TEXTURE_2D, TEXTURE_LOD_BIAS, AntiAliasing.mipmapBias);
+			var error = gl.getError();
+			ok = error == gl.NO_ERROR;
+			if (!ok) swapError = haxe.io.Path.withoutDirectory(job.file) + ': GL error ' + error + ' on finish';
+			context.__bindGLTexture2D(null);
+		}
+		if (ok)
+		{
+			var old = job.texture.__textureID;
+			job.texture.__textureID = job.glTexture;
+			job.texture.__samplerState = null;
+			gl.deleteTexture(old);
+			entry.scale = job.scale;
+			entry.total = job.levels;
+			entry.loaded = job.levels;
 			entry.later = job.down;
 			entry.asked = false;
+			entry.dropping = false;
 			entry.lastBig = Sys.time();
 			if (job.down) dropped++;
 			else sharpened++;
+			return;
 		}
-		else if (!job.down) entry.later = false;
-		p.levels = null;
+		if (job.glTexture != null) gl.deleteTexture(job.glTexture);
+		job.glTexture = null;
+		if (entry == null) return;
+		entry.dropping = false;
+		if (job.down) entry.lastBig = Sys.time();
+		else entry.later = false;
 	}
 
 	public static function request(file:String, width:Int, height:Int):Void
@@ -645,16 +794,18 @@ class VortexPixel
 		return 'VortexPixel: ${active ? 'on' : 'off in options'}${ClientPrefs.data.vortexEnhance ? '' : ' (enhance off)'}, $count cached textures, $sharp enhanced 2x ($waitingSharp more when zoomed in, $sharpened switched, $dropped dropped back)'
 			+ ' (${Math.round(bc7 / 1048576)} MB, plain PNGs would be ${Math.round(rgba / 1048576)} MB)'
 			+ ', $fromCache loaded from cache, $encoded made${waiting > 0 ? ', $waiting waiting' + (hold ? ' (paused)' : '') : ''}, $kept kept as PNG'
-			+ (lastResult.length > 0 ? '\n  last: $lastResult' : '') + (lastSharp.length > 0 ? '\n  last switched to 2x: $lastSharp' : '');
+			+ (lastResult.length > 0 ? '\n  last: $lastResult' : '') + (lastSharp.length > 0 ? '\n  last switched to 2x: $lastSharp' : '') + (swapError.length > 0 ? '\n  last switch failed: $swapError' : '');
 	}
 
 	static function work():Void
 	{
+		ProcessInfo.lowPriorityThread();
 		if (tasks == null)
 		{
 			tasks = new Deque<Task>();
 			for (i in 0...helpers)
 				Thread.create(function() {
+					ProcessInfo.lowPriorityThread();
 					var encoder = new BC7Encoder();
 					var enhancer = new Enhance();
 					while (true)
@@ -1105,14 +1256,40 @@ private class Sharp
 {
 	public var texture:TextureBase;
 	public var file:String;
-	public var payload:Payload;
 	public var down:Bool;
+	public var pieces:Deque<Piece> = new Deque<Piece>();
+	public var width:Int = 0;
+	public var height:Int = 0;
+	public var scale:Int = 1;
+	public var levels:Int = 0;
+	public var broken:Bool = false;
+	public var glTexture:lime.graphics.opengl.GLTexture;
 
 	public function new(texture:TextureBase, file:String, down:Bool)
 	{
 		this.texture = texture;
 		this.file = file;
 		this.down = down;
+	}
+}
+
+private class Piece
+{
+	public var level:Int;
+	public var y:Int;
+	public var rows:Int = 0;
+	public var pooled:Bool = true;
+	public var width:Int;
+	public var data:Bytes;
+	public var len:Int;
+
+	public function new(level:Int, y:Int, width:Int, data:Bytes, len:Int)
+	{
+		this.level = level;
+		this.y = y;
+		this.width = width;
+		this.data = data;
+		this.len = len;
 	}
 }
 
