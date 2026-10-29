@@ -157,14 +157,24 @@ class BC7
 class BC7Decoder
 {
 	var rbits:Int = 0;
-	var rsrc:Bytes;
+	var rsrc:Mem;
 	var roff:Int = 0;
-	var e = new Vector<Int>(16);
-	var ind = new Vector<Int>(16);
-	var ind2 = new Vector<Int>(16);
-	var p = new Vector<Int>(4);
+	var eData = new Vector<Int>(16);
+	var e:Ptr<Int>;
+	var indData = new Vector<Int>(16);
+	var ind:Ptr<Int>;
+	var ind2Data = new Vector<Int>(16);
+	var ind2:Ptr<Int>;
+	var pData = new Vector<Int>(4);
+	var p:Ptr<Int>;
 
-	public function new() {}
+	public function new()
+	{
+		e = Ptr.of(eData);
+		ind = Ptr.of(indData);
+		ind2 = Ptr.of(ind2Data);
+		p = Ptr.of(pData);
+	}
 
 	function take(n:Int):Int
 	{
@@ -178,9 +188,10 @@ class BC7Decoder
 		return v;
 	}
 
-	public function decodeBlock(src:Bytes, off:Int, out:Vector<Int>):Bool
+	public function decodeBlock(src:Bytes, off:Int, target:Vector<Int>):Bool
 	{
-		rsrc = src;
+		var out = Ptr.of(target);
+		rsrc = Mem.of(src);
 		roff = off;
 		rbits = 0;
 		var mode = 0;
@@ -271,6 +282,7 @@ class BC7Encoder
 	public static inline var GOOD:Int = 48;
 	public static inline var HARD:Int = 160;
 	static inline var TOP:Int = 8;
+	static inline var PICKS:Int = 2;
 
 	public var sse:Float = 0;
 	public var counted:Float = 0;
@@ -279,36 +291,78 @@ class BC7Encoder
 	public var modeCount:Vector<Int> = new Vector<Int>(8);
 	public var checkDecode:Bool = true;
 
-	var px = new Vector<Int>(64);
-	var blk = new Vector<Int>(16);
-	var best = new Vector<Int>(16);
+	var pxData = new Vector<Int>(64);
+	var px:Ptr<Int>;
+	var blkData = new Vector<Int>(16);
+	var blk:Ptr<Int>;
+	var bestData = new Vector<Int>(16);
+	var best:Ptr<Int>;
 	var bestErr:Int = 0;
 	var bestMode:Int = 0;
 	var bitPos:Int = 0;
 
-	var q = new Vector<Int>(16);
-	var pb = new Vector<Int>(4);
-	var ind = new Vector<Int>(16);
-	var ind2 = new Vector<Int>(16);
-	var tq = new Vector<Int>(8);
-	var tp = new Vector<Int>(2);
-	var tind = new Vector<Int>(16);
-	var pal = new Vector<Int>(64);
-	var ef = new Vector<Float>(8);
-	var dec = new Vector<Int>(64);
+	var qData = new Vector<Int>(16);
+	var q:Ptr<Int>;
+	var pbData = new Vector<Int>(4);
+	var pb:Ptr<Int>;
+	var indData = new Vector<Int>(16);
+	var ind:Ptr<Int>;
+	var ind2Data = new Vector<Int>(16);
+	var ind2:Ptr<Int>;
+	var tqData = new Vector<Int>(8);
+	var tq:Ptr<Int>;
+	var tpData = new Vector<Int>(2);
+	var tp:Ptr<Int>;
+	var tindData = new Vector<Int>(16);
+	var tind:Ptr<Int>;
+	var palData = new Vector<Int>(64);
+	var pal:Ptr<Int>;
+	var efData = new Vector<Float>(8);
+	var ef:Ptr<Float>;
+	var decData = new Vector<Int>(64);
+	var dec:Ptr<Int>;
 	var decoder = new BC7Decoder();
-	var top = new Vector<Int>(TOP);
-	var topErr = new Vector<Float>(TOP);
+	var topData = new Vector<Int>(TOP);
+	var top:Ptr<Int>;
+	var topErrData = new Vector<Float>(TOP);
+	var topErr:Ptr<Float>;
+	var picked:Int = 0;
+	var pickErrData = new Vector<Int>(PICKS);
+	var pickErr:Ptr<Int>;
+	var pickPartData = new Vector<Int>(PICKS);
+	var pickPart:Ptr<Int>;
+	var pickModeData = new Vector<Int>(PICKS);
+	var pickMode:Ptr<Int>;
 	var alpha0:Int = 0;
 	var alpha1:Int = 0;
 
 	public function new()
 	{
+		px = Ptr.of(pxData);
+		blk = Ptr.of(blkData);
+		best = Ptr.of(bestData);
+		q = Ptr.of(qData);
+		pb = Ptr.of(pbData);
+		ind = Ptr.of(indData);
+		ind2 = Ptr.of(ind2Data);
+		tq = Ptr.of(tqData);
+		tp = Ptr.of(tpData);
+		tind = Ptr.of(tindData);
+		pal = Ptr.of(palData);
+		ef = Ptr.of(efData);
+		dec = Ptr.of(decData);
+		top = Ptr.of(topData);
+		topErr = Ptr.of(topErrData);
+		pickErr = Ptr.of(pickErrData);
+		pickPart = Ptr.of(pickPartData);
+		pickMode = Ptr.of(pickModeData);
 		for (i in 0...8) modeCount[i] = 0;
 	}
 
-	public function encodeRows(rgba:Bytes, w:Int, h:Int, out:Bytes, outOff:Int, byStart:Int, byEnd:Int, ?pause:Void->Void):Void
+	public function encodeRows(rgbaBytes:Bytes, w:Int, h:Int, outBytes:Bytes, outOff:Int, byStart:Int, byEnd:Int, ?pause:Void->Void):Void
 	{
+		var rgba = Mem.of(rgbaBytes);
+		var out = Mem.of(outBytes);
 		var bw = (w + 3) >> 2;
 		for (by in byStart...byEnd)
 		{
@@ -347,14 +401,14 @@ class BC7Encoder
 				encodeBlock();
 				for (k in 0...16) out.set(o + k, best[k]);
 				modeCount[bestMode]++;
-				if (checkDecode) measure(out, o);
+				if (checkDecode) measure(outBytes, o);
 			}
 		}
 	}
 
 	function measure(out:Bytes, o:Int):Void
 	{
-		if (!decoder.decodeBlock(out, o, dec))
+		if (!decoder.decodeBlock(out, o, decData))
 		{
 			badPixels += 16;
 			maxErr = 255;
@@ -387,12 +441,16 @@ class BC7Encoder
 		keep(e6, 6);
 		if (bestErr <= GOOD) return;
 
-		tryAlphaModes(0);
-		if (bestErr <= GOOD) return;
+		if (!opaque)
+		{
+			tryAlphaModes(0);
+			if (bestErr <= GOOD) return;
+		}
 
 		var chans = opaque ? 3 : 4;
 		estimatePartitions(chans);
 		var tries = bestErr > HARD ? TOP : 2;
+		picked = 0;
 		for (t in 0...tries)
 		{
 			var p = top[t];
@@ -401,25 +459,59 @@ class BC7Encoder
 			var m0 = (~m1) & 0xFFFF;
 			if (opaque)
 			{
-				var e1 = fitSubset(m0, 0, 3, 6, 2, 3) + fitSubset(m1, 1, 3, 6, 2, 3);
-				packMode1(p);
-				keep(e1, 1);
-				var e3 = fitSubset(m0, 0, 3, 7, 1, 2) + fitSubset(m1, 1, 3, 7, 1, 2);
-				packMode3(p);
-				keep(e3, 3);
+				pick(fitSubset(m0, 0, 3, 6, 2, 3, 1) + fitSubset(m1, 1, 3, 6, 2, 3, 1), p, 1);
+				pick(fitSubset(m0, 0, 3, 7, 1, 2, 1) + fitSubset(m1, 1, 3, 7, 1, 2, 1), p, 3);
 			}
-			else
-			{
-				var e7 = fitSubset(m0, 0, 4, 5, 1, 2) + fitSubset(m1, 1, 4, 5, 1, 2);
-				packMode7(p);
-				keep(e7, 7);
-			}
-			if (bestErr <= GOOD) return;
+			else pick(fitSubset(m0, 0, 4, 5, 1, 2, 1) + fitSubset(m1, 1, 4, 5, 1, 2, 1), p, 7);
 		}
-		if (bestErr > HARD) for (rot in 1...4)
+		for (k in 0...picked)
+		{
+			var p = pickPart[k];
+			var m1 = BC7.PART2[p];
+			var m0 = (~m1) & 0xFFFF;
+			switch (pickMode[k])
+			{
+				case 1:
+					var e = fitSubset(m0, 0, 3, 6, 2, 3) + fitSubset(m1, 1, 3, 6, 2, 3);
+					packMode1(p);
+					keep(e, 1);
+				case 3:
+					var e = fitSubset(m0, 0, 3, 7, 1, 2) + fitSubset(m1, 1, 3, 7, 1, 2);
+					packMode3(p);
+					keep(e, 3);
+				default:
+					var e = fitSubset(m0, 0, 4, 5, 1, 2) + fitSubset(m1, 1, 4, 5, 1, 2);
+					packMode7(p);
+					keep(e, 7);
+			}
+		}
+		if (bestErr <= GOOD || opaque || bestErr <= HARD) return;
+		for (rot in 1...4)
 		{
 			tryAlphaModes(rot);
 			if (bestErr <= GOOD) return;
+		}
+	}
+
+	function pick(err:Int, part:Int, mode:Int):Void
+	{
+		if (picked == PICKS && err >= pickErr[picked - 1]) return;
+		var k = picked < PICKS ? picked++ : picked - 1;
+		pickErr[k] = err;
+		pickPart[k] = part;
+		pickMode[k] = mode;
+		while (k > 0 && pickErr[k] < pickErr[k - 1])
+		{
+			var t = pickErr[k];
+			pickErr[k] = pickErr[k - 1];
+			pickErr[k - 1] = t;
+			t = pickPart[k];
+			pickPart[k] = pickPart[k - 1];
+			pickPart[k - 1] = t;
+			t = pickMode[k];
+			pickMode[k] = pickMode[k - 1];
+			pickMode[k - 1] = t;
+			k--;
 		}
 	}
 
@@ -492,28 +584,51 @@ class BC7Encoder
 		}
 	}
 
-	function quantChan(x:Float, p:Int, cb:Int, pm:Int):Int
+	static var qCode:Vector<Int> = buildTables();
+	static var qp:Ptr<Int> = Ptr.of(qCode);
+
+	static function buildTables():Vector<Int>
 	{
-		var maxc = (1 << cb) - 1;
-		var g:Int;
-		if (pm == 0) g = Math.round(x * maxc / 255);
-		else g = (Math.round(x * ((1 << (cb + 1)) - 1) / 255) - p) >> 1;
-		var bestC = 0;
-		var bestD = 1e30;
-		for (k in -1...2)
+		var t = new Vector<Int>(15 * 1021);
+		for (cb in 4...9) for (m in 0...3)
 		{
-			var c = g + k;
-			if (c < 0 || c > maxc) continue;
-			var v = pm == 0 ? BC7.expand(c, cb) : BC7.expand((c << 1) | p, cb + 1);
-			var d = v - x;
-			if (d < 0) d = -d;
-			if (d < bestD)
+			var pm = m == 0 ? 0 : 1;
+			var p = m == 2 ? 1 : 0;
+			var maxc = (1 << cb) - 1;
+			var base = ((cb - 4) * 3 + m) * 1021;
+			for (i in 0...1021)
 			{
-				bestD = d;
-				bestC = c;
+				var x = i / 4;
+				var g:Int;
+				if (pm == 0) g = Math.round(x * maxc / 255);
+				else g = (Math.round(x * ((1 << (cb + 1)) - 1) / 255) - p) >> 1;
+				var bestC = 0;
+				var bestD = 1e30;
+				for (k in -1...2)
+				{
+					var c = g + k;
+					if (c < 0 || c > maxc) continue;
+					var e = pm == 0 ? BC7.expand(c, cb) : BC7.expand((c << 1) | p, cb + 1);
+					var d = e - x;
+					if (d < 0) d = -d;
+					if (d < bestD)
+					{
+						bestD = d;
+						bestC = c;
+					}
+				}
+				t[base + i] = bestC;
 			}
 		}
-		return bestC;
+		return t;
+	}
+
+	inline function quantChan(x:Float, p:Int, cb:Int, pm:Int):Int
+	{
+		var i = Std.int(x * 4 + 0.5);
+		if (i < 0) i = 0;
+		if (i > 1020) i = 1020;
+		return qp[((cb - 4) * 3 + (pm == 0 ? 0 : 1 + p)) * 1021 + i];
 	}
 
 	inline function value(code:Int, p:Int, cb:Int, pm:Int):Int
@@ -560,7 +675,7 @@ class BC7Encoder
 		}
 	}
 
-	function fitSubset(mask:Int, s:Int, chans:Int, cb:Int, pm:Int, ib:Int):Int
+	function fitSubset(mask:Int, s:Int, chans:Int, cb:Int, pm:Int, ib:Int, iters:Int = 3):Int
 	{
 		var n = 0;
 		var m0 = 0.0, m1 = 0.0, m2 = 0.0, m3 = 0.0;
@@ -624,19 +739,19 @@ class BC7Encoder
 		ef[4] = clamp(m0 + a0 * tmax); ef[5] = clamp(m1 + a1 * tmax); ef[6] = clamp(m2 + a2 * tmax); ef[7] = clamp(m3 + a3 * tmax);
 		if (chans == 3) { ef[3] = 255; ef[7] = 255; }
 
-		var wt = BC7.weights(ib);
+		var wt = Ptr.ofArray(BC7.weights(ib));
 		var levels = 1 << ib;
 		var bestE = 0x7FFFFFFF;
-		for (iter in 0...3)
+		for (iter in 0...iters)
 		{
 			quantize(chans, cb, pm);
-			for (k in 0...levels)
+			for (c in 0...chans)
 			{
-				var w = wt[k];
-				for (c in 0...chans)
+				var v0 = value(tq[c], tp[0], cb, pm);
+				var v1 = value(tq[4 + c], tp[1], cb, pm);
+				for (k in 0...levels)
 				{
-					var v0 = value(tq[c], tp[0], cb, pm);
-					var v1 = value(tq[4 + c], tp[1], cb, pm);
+					var w = wt[k];
 					pal[k * 4 + c] = ((64 - w) * v0 + w * v1 + 32) >> 6;
 				}
 			}
@@ -673,7 +788,7 @@ class BC7Encoder
 				pb[s * 2 + 1] = tp[1];
 				for (i in 0...16) if ((mask >> i) & 1 == 1) ind[i] = tind[i];
 			}
-			if (err == 0 || iter == 2) break;
+			if (err == 0 || iter == iters - 1) break;
 
 			var sa = 0.0, sb = 0.0, sc = 0.0;
 			var x00 = 0.0, x01 = 0.0, x02 = 0.0, x03 = 0.0, x10 = 0.0, x11 = 0.0, x12 = 0.0, x13 = 0.0;
@@ -710,7 +825,7 @@ class BC7Encoder
 			if (a < lo) lo = a;
 			if (a > hi) hi = a;
 		}
-		var wt = BC7.weights(ib);
+		var wt = Ptr.ofArray(BC7.weights(ib));
 		var levels = 1 << ib;
 		var bestE = 0x7FFFFFFF;
 		var lo0 = quantChan(lo, 0, ab, 0);

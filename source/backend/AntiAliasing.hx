@@ -15,6 +15,7 @@ import shaders.RGBPalette.RGBPaletteShader;
 @:access(openfl.display.BitmapData)
 @:access(openfl.display3D.Context3D)
 @:access(openfl.display3D.textures.TextureBase)
+@:access(flixel.graphics.tile.FlxDrawQuadsItem)
 class AntiAliasing
 {
 	public static inline var CLASSIC:String = 'Classic';
@@ -192,12 +193,32 @@ class AntiAliasing
 		var quads:FlxDrawQuadsItem = Std.downcast(item, FlxDrawQuadsItem);
 		if (quads == null || quads.graphics == null) return;
 		var graphic:FlxGraphic = quads.graphics;
+		if (graphic.bitmap != null && backend.pixel.VortexPixel.watchesScale(graphic.bitmap.__texture))
+			backend.pixel.VortexPixel.drawnAt(graphic.bitmap.__texture, drawScale(quads, camera));
 		var shader = quads.shader != null ? quads.shader : graphic.shader;
 		if (shader == null || shader.bitmap == null) return;
 		if (shader != graphic.shader && !Std.isOfType(shader, RGBPaletteShader)) return;
-		var entry:MipmapEntry = (mipmapsActive || enhanced(graphic)) ? entries.get(graphic) : null;
+		var sharp = enhanced(graphic);
+		var entry:MipmapEntry = (mipmapsActive || sharp) ? entries.get(graphic) : null;
+		if (sharp && entry != null && (!entry.ready || outdated(graphic, entry))) build(graphic, entry);
 		var smooth:Bool = camera.antialiasing || quads.antialiasing;
 		shader.bitmap.mipFilter = (entry != null && entry.ready && smooth) ? MIPLINEAR : MIPNONE;
+	}
+
+	static function drawScale(quads:FlxDrawQuadsItem, camera:FlxCamera):Float
+	{
+		var t = quads.transforms;
+		var best = 0.0;
+		var i = 0;
+		var n = t.length;
+		while (i + 3 < n)
+		{
+			var det = t[i] * t[i + 3] - t[i + 1] * t[i + 2];
+			if (det < 0) det = -det;
+			if (det > best) best = det;
+			i += 6;
+		}
+		return Math.sqrt(best) * camera.totalScaleX;
 	}
 
 	static function checkMipmaps():Void

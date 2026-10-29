@@ -19,7 +19,9 @@ import sys.thread.Thread;
 class VortexPixel
 {
 	public static inline var VERSION:Int = 3;
-	public static inline var MIN_PIXELS:Int = 256 * 256;
+	public static inline var MIN_PIXELS:Int = 64 * 64;
+	public static inline var SHARP_AT:Float = 1.15;
+	public static inline var DROP_AFTER:Float = 15;
 	public static inline var MIN_PSNR:Float = 44;
 	public static inline var MAX_BAD:Float = 0.005;
 	public static inline var MAX_BAD_PIXEL_ART:Float = 0.0002;
@@ -58,6 +60,12 @@ class VortexPixel
 	static var helpers:Int = 0;
 	static var hold:Bool = false;
 	static var owned:Map<TextureBase, Owned> = new Map();
+	static var sharpJobs:Deque<Sharp>;
+	static var sharpDone:Deque<Sharp>;
+	public static var sharpened(default, null):Int = 0;
+	public static var lastSharp(default, null):String = '';
+	public static var dropped(default, null):Int = 0;
+	static var lastDropCheck:Float = 0;
 	static var budgetMutex:Mutex = new Mutex();
 	static var inFlight:Float = 0;
 	static inline var BUDGET:Float = 256 * 1048576;
@@ -109,7 +117,7 @@ class VortexPixel
 			status = 'on';
 			FlxG.signals.preUpdate.add(updateHold);
 			var cores = Std.int(Math.max(1, states.LoadingState.getCPUThreadsCount()));
-			helpers = Std.int(Math.max(1, Math.min(6, cores - 2)));
+			helpers = Std.int(Math.max(1, Math.min(31, cores - 1)));
 		}
 		catch (e:Dynamic)
 		{
@@ -144,6 +152,7 @@ class VortexPixel
 
 	static function updateHold():Void
 	{
+		applySharp();
 		var state = FlxG.state;
 		hold = Std.isOfType(state, states.PlayState) || Std.isOfType(state, states.LoadingState)
 			|| states.LoadingState.loadMax > 0;
@@ -193,7 +202,7 @@ class VortexPixel
 		return b;
 	}
 
-	public static function readCached(file:String, mips:Bool, ?budget:Bool = false):Payload
+	public static function readCached(file:String, mips:Bool, ?budget:Bool = false, ?sharp:Null<Bool>):Payload
 	{
 		if (!active || file == null) return null;
 		mutex.acquire();
@@ -235,11 +244,13 @@ class VortexPixel
 				}
 				var wantEnhance = ClientPrefs.data.vortexEnhance;
 				if (flags & 4 == 4 && wantEnhance) throw 'redo';
-				var enhanced = flags & 2 == 2;
-				var skip = enhanced && !wantEnhance ? 1 : 0;
+				var enhanced = flags & 2 == 2 && wantEnhance;
+				var useSharp = enhanced && (sharp != null ? sharp : sharpNow());
+				var skip = flags & 2 == 2 && !useSharp ? 1 : 0;
 				upgrade = flags & 8 == 8 && wantEnhance;
-				var scale = enhanced && wantEnhance ? 2 : 1;
+				var scale = useSharp ? 2 : 1;
 				p = new Payload(file, w, h, levels - skip, scale);
+				p.later = enhanced && !useSharp;
 				var count = (scale > 1 || mips) ? p.total : 1;
 				if (budget)
 				{
@@ -314,6 +325,7 @@ class VortexPixel
 		var chunks = input.readInt32();
 		var data = discard ? null : Bytes.alloc(total);
 		var pos = 0;
+		var zbuf:Bytes = null;
 		for (i in 0...chunks)
 		{
 			var raw = input.readInt32();
@@ -323,9 +335,30 @@ class VortexPixel
 				input.seek(zlen, SeekCur);
 				continue;
 			}
-			var piece = haxe.zip.Uncompress.run(input.read(zlen), raw);
-			data.blit(pos, piece, 0, piece.length);
-			pos += piece.length;
+			if (zbuf == null || zbuf.length < zlen) zbuf = Bytes.alloc(zlen + (zlen >> 2));
+			input.readFullBytes(zbuf, 0, zlen);
+			if (pos + raw > total) throw 'long level';
+			var u = new haxe.zip.Uncompress();
+			var read = 0;
+			var wrote = 0;
+			try
+			{
+				while (wrote < raw)
+				{
+					var r = u.execute(zbuf, read, data, pos + wrote);
+					read += r.read;
+					wrote += r.write;
+					if (r.done || (r.read == 0 && r.write == 0)) break;
+				}
+			}
+			catch (e:Dynamic)
+			{
+				u.close();
+				throw e;
+			}
+			u.close();
+			if (wrote != raw) throw 'bad chunk';
+			pos += raw;
 		}
 		if (!discard && pos != total) throw 'short level';
 		return data;
@@ -379,6 +412,9 @@ class VortexPixel
 		bitmap.__textureHeight = p.height;
 		bitmap.readable = true;
 		var entry = new Owned(p.file, p.width, p.height, p.total, p.levels.length, p.scale);
+		entry.later = p.later;
+		entry.hasSharp = p.later || p.scale > 1;
+		entry.lastBig = Sys.time();
 		owned.set(texture, entry);
 		p.levels = null;
 		fromCache++;
@@ -423,7 +459,7 @@ class VortexPixel
 		var entry = owned.get(texture);
 		if (entry == null) return false;
 		if (entry.loaded >= entry.total) return true;
-		var p = readCached(entry.file, true);
+		var p = readCached(entry.file, true, false, entry.scale > 1);
 		if (p == null || p.levels.length != entry.total || p.scale != entry.scale) return false;
 		p.levels.splice(0, entry.loaded);
 		var context = Lib.current.stage.context3D;
@@ -437,6 +473,122 @@ class VortexPixel
 		context.__bindGLTexture2D(null);
 		if (ok) entry.loaded = entry.total;
 		return ok;
+	}
+
+	public static function sharpNow():Bool
+		return FlxG.scaleMode.scale.x > SHARP_AT;
+
+	public static function watchesScale(texture:TextureBase):Bool
+	{
+		if (texture == null) return false;
+		var entry = owned.get(texture);
+		return entry != null && entry.hasSharp;
+	}
+
+	public static function drawnAt(texture:TextureBase, scale:Float):Void
+	{
+		if (scale <= SHARP_AT) return;
+		var entry = owned.get(texture);
+		if (entry == null || !entry.hasSharp) return;
+		entry.lastBig = Sys.time();
+		if (!entry.later || entry.asked) return;
+		entry.asked = true;
+		lastSharp = haxe.io.Path.withoutDirectory(entry.file) + ' at ' + (Math.round(scale * 100) / 100) + 'x';
+		queueSharp(new Sharp(texture, entry.file, false));
+	}
+
+	public static function canSharpen(texture:TextureBase):Bool
+	{
+		if (texture == null) return false;
+		var entry = owned.get(texture);
+		return entry != null && entry.later && !entry.asked;
+	}
+
+	static function queueSharp(job:Sharp):Void
+	{
+		if (sharpJobs == null)
+		{
+			sharpJobs = new Deque<Sharp>();
+			sharpDone = new Deque<Sharp>();
+			Thread.create(function() {
+				while (true)
+				{
+					var job = sharpJobs.pop(true);
+					try
+					{
+						job.payload = readCached(job.file, true, false, !job.down);
+					}
+					catch (e:Dynamic)
+					{
+						job.payload = null;
+					}
+					sharpDone.add(job);
+				}
+			});
+		}
+		sharpJobs.add(job);
+	}
+
+	@:access(openfl.display3D.textures.TextureBase)
+	static function checkDrops():Void
+	{
+		var now = Sys.time();
+		if (now - lastDropCheck < 1) return;
+		lastDropCheck = now;
+		for (texture => entry in owned)
+		{
+			if (entry.scale < 2 || entry.dropping || now - entry.lastBig < DROP_AFTER || texture.__textureID == null) continue;
+			entry.dropping = true;
+			queueSharp(new Sharp(texture, entry.file, true));
+		}
+	}
+
+	@:access(openfl.display3D.Context3D)
+	@:access(openfl.display3D.textures.TextureBase)
+	static function applySharp():Void
+	{
+		if (sharpDone == null) return;
+		checkDrops();
+		var job = sharpDone.pop(false);
+		if (job == null) return;
+		var p = job.payload;
+		var entry = owned.get(job.texture);
+		var want = job.down ? 1 : 2;
+		if (p == null || p.scale != want || entry == null || job.texture.__textureID == null || p.width != entry.width || p.height != entry.height)
+		{
+			if (entry != null)
+			{
+				if (job.down) entry.lastBig = Sys.time();
+				else entry.later = false;
+				entry.dropping = false;
+			}
+			return;
+		}
+		var context = Lib.current.stage.context3D;
+		var gl = context.gl;
+		var guard = 0;
+		while (gl.getError() != gl.NO_ERROR && guard++ < 16) {}
+		context.__bindGLTexture2D(job.texture.__textureID);
+		sendLevels(gl, p, 0);
+		gl.texParameteri(gl.TEXTURE_2D, TEXTURE_MAX_LEVEL, p.levels.length - 1);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, p.levels.length > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+		gl.texParameterf(gl.TEXTURE_2D, TEXTURE_LOD_BIAS, AntiAliasing.mipmapBias);
+		var ok = gl.getError() == gl.NO_ERROR;
+		context.__bindGLTexture2D(null);
+		entry.dropping = false;
+		if (ok)
+		{
+			entry.scale = want;
+			entry.total = p.total;
+			entry.loaded = p.levels.length;
+			entry.later = job.down;
+			entry.asked = false;
+			entry.lastBig = Sys.time();
+			if (job.down) dropped++;
+			else sharpened++;
+		}
+		else if (!job.down) entry.later = false;
+		p.levels = null;
 	}
 
 	public static function request(file:String, width:Int, height:Int):Void
@@ -468,6 +620,7 @@ class VortexPixel
 		if (!supported) return 'VortexPixel: $status';
 		var count = 0;
 		var sharp = 0;
+		var waitingSharp = 0;
 		var bc7 = 0.0;
 		var rgba = 0.0;
 		var gone = [];
@@ -480,6 +633,7 @@ class VortexPixel
 			}
 			count++;
 			if (entry.scale > 1) sharp++;
+			if (entry.later) waitingSharp++;
 			var mipScale = entry.loaded > 1 ? 4 / 3 : 1;
 			bc7 += entry.width * entry.height * entry.scale * entry.scale * mipScale;
 			rgba += entry.width * entry.height * 4 * (backend.AntiAliasing.mipmapsActive ? 4 / 3 : 1);
@@ -488,10 +642,10 @@ class VortexPixel
 		mutex.acquire();
 		var waiting = jobs.length;
 		mutex.release();
-		return 'VortexPixel: ${active ? 'on' : 'off in options'}${ClientPrefs.data.vortexEnhance ? '' : ' (enhance off)'}, $count cached textures, $sharp enhanced 2x'
+		return 'VortexPixel: ${active ? 'on' : 'off in options'}${ClientPrefs.data.vortexEnhance ? '' : ' (enhance off)'}, $count cached textures, $sharp enhanced 2x ($waitingSharp more when zoomed in, $sharpened switched, $dropped dropped back)'
 			+ ' (${Math.round(bc7 / 1048576)} MB, plain PNGs would be ${Math.round(rgba / 1048576)} MB)'
 			+ ', $fromCache loaded from cache, $encoded made${waiting > 0 ? ', $waiting waiting' + (hold ? ' (paused)' : '') : ''}, $kept kept as PNG'
-			+ (lastResult.length > 0 ? '\n  last: $lastResult' : '');
+			+ (lastResult.length > 0 ? '\n  last: $lastResult' : '') + (lastSharp.length > 0 ? '\n  last switched to 2x: $lastSharp' : '');
 	}
 
 	static function work():Void
@@ -509,12 +663,14 @@ class VortexPixel
 						try
 						{
 							runTask(t, encoder, enhancer);
+							t.raw = t.out.length;
+							t.out = haxe.zip.Compress.run(t.out, 3);
 						}
 						catch (e:Dynamic)
 						{
 							t.failed = true;
 						}
-						t.done.release();
+						t.done.add(t);
 					}
 				});
 		}
@@ -650,6 +806,7 @@ class VortexPixel
 			return 2;
 		}
 		for (level in 1...mipSizes.length) if (!plain(level)) return pause(part);
+		images.splice(1, images.length);
 		var oneX = [for (level in 0...mipSizes.length) kindOf(level)];
 		if (!enh)
 		{
@@ -689,38 +846,34 @@ class VortexPixel
 	{
 		var todo = [for (i in 0...units.length) if (!part.has(kind, i)) i];
 		resumedUnits += units.length - todo.length;
-		var batch = helpers * 2;
-		var i = 0;
-		while (i < todo.length)
+		var window = helpers * 2;
+		var done = new Deque<Task>();
+		var next = 0;
+		var running = 0;
+		var failed = false;
+		while (true)
 		{
-			if (hold) return false;
-			var done = new Lock();
-			var list:Array<Task> = [];
-			var n = Std.int(Math.min(batch, todo.length - i));
-			for (j in 0...n)
+			while (!failed && !hold && running < window && next < todo.length)
 			{
-				var u = units[todo[i + j]];
+				var u = units[todo[next]];
 				var t = new Task(rgba, w, h, u[0], u[1], done, check, enhance);
-				t.index = todo[i + j];
-				list.push(t);
+				t.index = todo[next];
 				tasks.add(t);
+				next++;
+				running++;
 			}
-			for (j in 0...n) done.wait();
-			var failed = false;
-			for (t in list)
+			if (running == 0) break;
+			var t = done.pop(true);
+			running--;
+			if (t.failed)
 			{
-				if (t.failed)
-				{
-					failed = true;
-					continue;
-				}
-				part.add(kind, t.index, t.out, t.sse, t.counted, t.bad, t.bpSse, t.bpCounted);
-				t.out = null;
+				failed = true;
+				continue;
 			}
-			if (failed) return false;
-			i += n;
+			part.add(kind, t.index, t.out, t.raw, t.sse, t.counted, t.bad, t.bpSse, t.bpCounted);
+			t.out = null;
 		}
-		return part.count(kind) >= units.length;
+		return !failed && part.count(kind) >= units.length;
 	}
 
 	static function finish(file:String, start:Float, psnr:Float, bad:Float, ok:Bool, pixelArt:Bool, enhanced:Bool, back:Float):Void
@@ -910,6 +1063,7 @@ class Payload
 	public var total:Int;
 	public var scale:Int;
 	public var reserved:Float = 0;
+	public var later:Bool = false;
 	public var levels:Array<Bytes> = [];
 
 	public function new(file:String, width:Int, height:Int, total:Int, scale:Int)
@@ -930,6 +1084,11 @@ private class Owned
 	public var total:Int;
 	public var loaded:Int;
 	public var scale:Int;
+	public var later:Bool = false;
+	public var asked:Bool = false;
+	public var hasSharp:Bool = false;
+	public var dropping:Bool = false;
+	public var lastBig:Float = 0;
 
 	public function new(file:String, width:Int, height:Int, total:Int, loaded:Int, scale:Int)
 	{
@@ -942,6 +1101,21 @@ private class Owned
 	}
 }
 
+private class Sharp
+{
+	public var texture:TextureBase;
+	public var file:String;
+	public var payload:Payload;
+	public var down:Bool;
+
+	public function new(texture:TextureBase, file:String, down:Bool)
+	{
+		this.texture = texture;
+		this.file = file;
+		this.down = down;
+	}
+}
+
 private class Task
 {
 	public var rgba:Bytes;
@@ -949,11 +1123,12 @@ private class Task
 	public var height:Int;
 	public var from:Int;
 	public var to:Int;
-	public var done:Lock;
+	public var done:Deque<Task>;
 	public var check:Bool;
 	public var enhance:Bool;
 	public var index:Int = 0;
 	public var out:Bytes;
+	public var raw:Int = 0;
 	public var failed:Bool = false;
 	public var sse:Float = 0;
 	public var counted:Float = 0;
@@ -961,7 +1136,7 @@ private class Task
 	public var bpSse:Float = 0;
 	public var bpCounted:Float = 0;
 
-	public function new(rgba:Bytes, width:Int, height:Int, from:Int, to:Int, done:Lock, check:Bool, enhance:Bool)
+	public function new(rgba:Bytes, width:Int, height:Int, from:Int, to:Int, done:Deque<Task>, check:Bool, enhance:Bool)
 	{
 		this.rgba = rgba;
 		this.width = width;
@@ -1087,13 +1262,12 @@ private class Partial
 		return n;
 	}
 
-	public function add(kind:Int, index:Int, data:Bytes, sse:Float, counted:Float, bad:Float, bpSse:Float, bpCounted:Float):Void
+	public function add(kind:Int, index:Int, z:Bytes, raw:Int, sse:Float, counted:Float, bad:Float, bpSse:Float, bpCounted:Float):Void
 	{
-		var z = haxe.zip.Compress.run(data, 3);
 		var r = new Record();
 		r.kind = kind;
 		r.index = index;
-		r.raw = data.length;
+		r.raw = raw;
 		r.zlen = z.length;
 		r.sse = sse;
 		r.counted = counted;

@@ -88,7 +88,7 @@ class Enhance
 		table = t;
 	}
 
-	public function band(src:Bytes, w:Int, h:Int, y0:Int, y1:Int):Bytes
+	public function band(srcBytes:Bytes, w:Int, h:Int, y0:Int, y1:Int):Bytes
 	{
 		var ry0 = y0 - MARGIN < 0 ? 0 : y0 - MARGIN;
 		var ry1 = y1 + MARGIN > h ? h : y1 + MARGIN;
@@ -103,6 +103,13 @@ class Enhance
 		if (codes == null || codes.length < rows * w) codes = new Vector<Int>(rows * w);
 		if (res == null || res.length < rows * w * 4) res = new Vector<Int>(rows * w * 4);
 		if (zero == null || zero.length < rows * w * 4) zero = Bytes.alloc(rows * w * 4);
+		var src = Mem.of(srcBytes);
+		var up = Mem.of(this.up);
+		var zero = Mem.of(this.zero);
+		var tensor = Ptr.of(this.tensor);
+		var rowSum = Ptr.of(this.rowSum);
+		var codes = Ptr.of(this.codes);
+		var res = Ptr.of(this.res);
 
 		inline function feat(x:Int, y:Int):Int
 		{
@@ -177,7 +184,7 @@ class Enhance
 			}
 		}
 
-		var t = table;
+		var t = Ptr.of(table);
 		for (r in 0...rows)
 		{
 			var y = ry0 + r;
@@ -352,7 +359,7 @@ class Enhance
 		}
 
 		var out = Bytes.alloc((y1 - y0) * 2 * w2 * 4);
-		out.blit(0, up, (y0 - ry0) * 2 * w2 * 4, out.length);
+		out.blit(0, this.up, (y0 - ry0) * 2 * w2 * 4, out.length);
 		for (y in y0...y1)
 		{
 			var r = y - ry0;
